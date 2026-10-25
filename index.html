@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Formatter &amp; Inspector</title>
+<!-- External CSS (pinned) -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body class="app" ng-app="dfiApp" ng-controller="MainController as vm" ng-class="'theme-' + vm.theme">
+
+<!-- Icon sprite -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9L7 7M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></symbol>
+  <symbol id="i-wand" viewBox="0 0 24 24"><path d="M4 20L16 8M14 6l4 4M18 2v3M16.5 3.5h3M6 4v2M5 5h2"/></symbol>
+  <symbol id="i-compress" viewBox="0 0 24 24"><path d="M4 9h6V3M20 9h-6V3M4 15h6v6M20 15h-6v6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M7 4L3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 21h16"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V3M7 8l5-5 5 5M4 21h16"/></symbol>
+  <symbol id="i-paste" viewBox="0 0 24 24"><rect x="6" y="5" width="12" height="16" rx="2"/><path d="M9 5V3h6v2"/></symbol>
+  <symbol id="i-select" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2" stroke-dasharray="3 3"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-5-5"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3"/></symbol>
+  <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5M20 9H10a6 6 0 0 0 0 12h3"/></symbol>
+  <symbol id="i-jump" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+</svg>
+
+<!-- ============ Header ============ -->
+<header class="app-header">
+  <div class="brand">
+    <h1 class="app-title">Data Formatter &amp; Inspector</h1>
+    <span class="badge badge--local" title="Nothing is uploaded. All processing happens in your browser.">Runs locally</span>
+  </div>
+  <div class="header-actions">
+    <button type="button" id="themeToggle" class="btn btn--ghost" ng-click="vm.toggleTheme()"
+            ng-attr-title="{{ vm.theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme' }}">
+      <svg class="ic" ng-if="vm.theme === 'dark'"><use href="#i-sun"/></svg>
+      <svg class="ic" ng-if="vm.theme !== 'dark'"><use href="#i-moon"/></svg>
+      <span class="btn-label">{{ vm.theme === 'dark' ? 'Light' : 'Dark' }}</span>
+    </button>
+    <button type="button" id="clearAllBtn" class="btn btn--ghost btn--danger" ng-click="vm.clearAll()" title="Clear input, output, search and results">
+      <svg class="ic"><use href="#i-trash"/></svg><span class="btn-label">Clear all</span>
+    </button>
+    <div class="menu-wrap">
+      <button type="button" id="settingsBtn" class="btn btn--ghost" ng-click="vm.toggleSettings($event)" title="Formatting options" aria-haspopup="true" ng-attr-aria-expanded="{{ vm.showSettings }}">
+        <svg class="ic"><use href="#i-gear"/></svg><span class="btn-label">Settings</span>
+      </button>
+      <div class="popover settings-popover" id="settingsPopover" ng-show="vm.showSettings" ng-click="$event.stopPropagation()">
+        <label class="field">
+          <span>Indentation</span>
+          <select class="select" ng-model="vm.settings.indent" ng-change="vm.onSettingsChange()">
+            <option value="2">2 spaces</option>
+            <option value="4">4 spaces</option>
+            <option value="tab">Tabs</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" ng-model="vm.settings.wrap" ng-change="vm.onSettingsChange()"> Wrap long lines</label>
+        <label class="check"><input type="checkbox" ng-model="vm.settings.lineNumbers" ng-change="vm.onSettingsChange()"> Show line numbers</label>
+        <p class="hint">Indentation applies to Beautify and to conversions. Values are never reordered or changed.</p>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ Toolbar (sticky) ============ -->
+<nav class="toolbar" id="toolbar" aria-label="Formatting toolbar">
+  <div class="toolbar-group">
+    <label class="field field--inline" for="inputFormat"><span>Input</span></label>
+    <select id="inputFormat" class="select" ng-model="vm.inputFormat"
+            ng-options="f.id as f.label for f in vm.inputFormats" ng-change="vm.onInputFormatChange()"></select>
+    <button type="button" id="swapBtn" class="btn btn--icon" ng-click="vm.swapFormats()" ng-disabled="!vm.canSwap"
+            ng-attr-title="{{ vm.canSwap ? 'Swap input and output formats' : vm.swapHint }}">
+      <svg class="ic"><use href="#i-swap"/></svg><span class="sr-only">Swap formats</span>
+    </button>
+    <label class="field field--inline" for="outputFormat"><span>Output</span></label>
+    <select id="outputFormat" class="select" ng-model="vm.outputFormat"
+            ng-options="f.id as f.label for f in vm.outputFormats" ng-change="vm.onOutputFormatChange()"></select>
+  </div>
+
+  <div class="toolbar-group">
+    <button type="button" id="beautifyBtn" class="btn btn--primary" ng-click="vm.beautify()" title="Format and convert to the output format">
+      <svg class="ic"><use href="#i-wand"/></svg><span class="btn-label">Beautify</span>
+    </button>
+    <button type="button" id="minifyBtn" class="btn" ng-click="vm.minify()" title="Remove insignificant whitespace">
+      <svg class="ic"><use href="#i-compress"/></svg><span class="btn-label">Minify</span>
+    </button>
+    <button type="button" id="validateBtn" class="btn" ng-click="vm.validate()" title="Validate the input">
+      <svg class="ic"><use href="#i-check"/></svg><span class="btn-label">Validate</span>
+    </button>
+    <button type="button" id="resetBtn" class="btn" ng-click="vm.reset()" title="Reset formats and options, keep your input">
+      <svg class="ic"><use href="#i-reset"/></svg><span class="btn-label">Reset</span>
+    </button>
+  </div>
+
+  <div class="toolbar-group toolbar-group--end">
+    <span class="dirty-note" ng-if="vm.settings.mode === 'manual' && vm.dirty">Input changed. Run Beautify or Validate.</span>
+    <span class="processing" ng-show="vm.processing"><span class="spinner"></span>Processing…</span>
+    <div class="segmented" role="group" aria-label="Processing mode">
+      <button type="button" id="modeAuto" class="seg" ng-class="{active: vm.settings.mode === 'auto'}" ng-click="vm.setMode('auto')" title="Update results as you type">Auto</button>
+      <button type="button" id="modeManual" class="seg" ng-class="{active: vm.settings.mode === 'manual'}" ng-click="vm.setMode('manual')" title="Process only when you click a button">Manual</button>
+    </div>
+  </div>
+  <div class="progress-bar" ng-show="vm.processing"><span></span></div>
+</nav>
+
+<!-- ============ Workspace ============ -->
+<main class="workspace" id="workspace">
+
+  <!-- Input panel -->
+  <section class="panel panel--input" id="inputPanel" dfi-drop-zone="vm.handleFiles(files, 'input')">
+    <div class="panel-header">
+      <div class="panel-title"><span>Input</span><span class="format-badge" id="inputFormatBadge">{{ vm.inputFormatLabel }}</span></div>
+      <div class="panel-actions">
+        <div class="menu-wrap">
+          <button type="button" id="sampleBtn" class="btn btn--small" ng-click="vm.toggleSampleMenu($event)" title="Load sample data" aria-haspopup="true">
+            <svg class="ic"><use href="#i-file"/></svg><span class="btn-label">Samples</span>
+          </button>
+          <ul class="popover menu" id="sampleMenu" ng-show="vm.sampleMenuOpen">
+            <li ng-repeat="s in vm.samples track by s.id"><button type="button" class="menu-item" ng-click="vm.loadSample(s)">{{ s.label }}</button></li>
+          </ul>
+        </div>
+        <button type="button" class="btn btn--small" ng-click="vm.triggerUpload('input')" title="Upload a file (.json .xml .yaml .yml .txt .java)">
+          <svg class="ic"><use href="#i-upload"/></svg><span class="btn-label">Upload</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.pasteFromClipboard()" title="Paste from clipboard">
+          <svg class="ic"><use href="#i-paste"/></svg><span class="btn-label">Paste</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.selectAll('input')" title="Select all">
+          <svg class="ic"><use href="#i-select"/></svg><span class="btn-label">Select all</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.copy('input')" title="Copy input">
+          <svg class="ic"><use href="#i-copy"/></svg><span class="btn-label">Copy</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.download('input')" title="Download input">
+          <svg class="ic"><use href="#i-download"/></svg><span class="btn-label">Download</span>
+        </button>
+        <button type="button" class="btn btn--small btn--danger" ng-click="vm.clearPanel('input')" title="Clear input">
+          <svg class="ic"><use href="#i-trash"/></svg><span class="btn-label">Clear</span>
+        </button>
+      </div>
+    </div>
+    <div class="stats-bar" id="inputStats">
+      <span class="stat"><b>{{ vm.stats.input.chars | number }}</b> chars</span>
+      <span class="stat"><b>{{ vm.stats.input.bytes | number }}</b> bytes</span>
+      <span class="stat"><b>{{ vm.stats.input.lines | number }}</b> lines</span>
+      <span class="stat"><b>{{ vm.stats.input.words | number }}</b> words</span>
+      <span class="stat"><b>{{ vm.stats.input.emptyLines | number }}</b> empty lines</span>
+      <span class="stat"><b>{{ vm.stats.input.longestLine | number }}</b> longest line</span>
+      <span class="stat" title="Leading / trailing whitespace characters"><b>{{ vm.stats.input.leadingWs }}/{{ vm.stats.input.trailingWs }}</b> edge whitespace</span>
+    </div>
+    <div class="editor-wrap">
+      <div id="inputEditor" class="editor"></div>
+      <div class="drop-overlay">Drop a text file to load it here</div>
+    </div>
+    <input type="file" id="fileInputInput" class="sr-only" tabindex="-1" accept=".json,.xml,.yaml,.yml,.txt,.java" dfi-file-input="vm.handleFiles(files, 'input')">
+  </section>
+
+  <div class="resizer" id="panelResizer" dfi-resizer role="separator" aria-orientation="vertical" tabindex="0" title="Drag to resize the panels"></div>
+
+  <!-- Output panel -->
+  <section class="panel panel--output" id="outputPanel" dfi-drop-zone="vm.handleFiles(files, 'output')">
+    <div class="panel-header">
+      <div class="panel-title">
+        <span>Formatted output</span><span class="format-badge" id="outputFormatBadge">{{ vm.outputFormatLabel }}</span>
+        <span class="format-badge format-badge--edited" ng-if="vm.outputEdited" title="Output was edited by replace or upload">edited</span>
+      </div>
+      <div class="panel-actions">
+        <button type="button" id="searchToggleBtn" class="btn btn--small" ng-class="{active: vm.search.open}" ng-click="vm.toggleSearch()" title="Search output (Ctrl+F)">
+          <svg class="ic"><use href="#i-search"/></svg><span class="btn-label">Search</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.triggerUpload('output')" title="Upload a file into the output">
+          <svg class="ic"><use href="#i-upload"/></svg><span class="btn-label">Upload</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.selectAll('output')" title="Select all">
+          <svg class="ic"><use href="#i-select"/></svg><span class="btn-label">Select all</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.copy('output')" title="Copy output">
+          <svg class="ic"><use href="#i-copy"/></svg><span class="btn-label">Copy</span>
+        </button>
+        <button type="button" class="btn btn--small" ng-click="vm.download('output')" title="Download output">
+          <svg class="ic"><use href="#i-download"/></svg><span class="btn-label">Download</span>
+        </button>
+        <button type="button" class="btn btn--small btn--danger" ng-click="vm.clearPanel('output')" title="Clear output">
+          <svg class="ic"><use href="#i-trash"/></svg><span class="btn-label">Clear</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Search bar attached to the output editor -->
+    <div class="search-bar" id="searchBar" ng-show="vm.search.open">
+      <div class="search-row">
+        <svg class="ic ic--muted"><use href="#i-search"/></svg>
+        <input type="text" id="searchInput" class="input input--search" placeholder="Search output" autocomplete="off" spellcheck="false"
+               ng-model="vm.search.query" ng-model-options="{debounce: 150}" ng-change="vm.onSearchChange()" ng-keydown="vm.onSearchKeydown($event)">
+        <button type="button" class="toggle" ng-class="{active: vm.search.caseSensitive}" ng-click="vm.toggleSearchOption('caseSensitive')" title="Match case" aria-pressed="{{ vm.search.caseSensitive }}">Aa</button>
+        <button type="button" class="toggle" ng-class="{active: vm.search.wholeWord}" ng-click="vm.toggleSearchOption('wholeWord')" title="Whole word" aria-pressed="{{ vm.search.wholeWord }}">W</button>
+        <button type="button" class="toggle" ng-class="{active: vm.search.regex}" ng-click="vm.toggleSearchOption('regex')" title="Regular expression" aria-pressed="{{ vm.search.regex }}">.*</button>
+        <span class="search-count" id="searchCount" ng-class="{'is-error': vm.search.error, 'is-empty': vm.search.query && !vm.search.total && !vm.search.error}">{{ vm.search.status }}</span>
+        <button type="button" class="btn btn--icon btn--small" ng-click="vm.prevMatch()" ng-disabled="!vm.search.total" title="Previous match (Shift+Enter)"><svg class="ic"><use href="#i-up"/></svg><span class="sr-only">Previous match</span></button>
+        <button type="button" class="btn btn--icon btn--small" ng-click="vm.nextMatch()" ng-disabled="!vm.search.total" title="Next match (Enter)"><svg class="ic"><use href="#i-down"/></svg><span class="sr-only">Next match</span></button>
+        <button type="button" class="toggle toggle--text" ng-class="{active: vm.search.showReplace}" ng-click="vm.toggleReplace()" title="Show replace">Replace</button>
+        <button type="button" class="btn btn--icon btn--small" ng-click="vm.clearSearch()" title="Clear search (Esc)"><svg class="ic"><use href="#i-close"/></svg><span class="sr-only">Clear search</span></button>
+      </div>
+      <div class="search-error" ng-if="vm.search.error">{{ vm.search.error }}</div>
+      <div class="search-row" ng-if="vm.search.showReplace">
+        <svg class="ic ic--muted"><use href="#i-wand"/></svg>
+        <input type="text" id="replaceInput" class="input input--search" placeholder="Replace with" autocomplete="off" spellcheck="false"
+               ng-model="vm.search.replaceText" ng-keydown="vm.onReplaceKeydown($event)">
+        <button type="button" class="btn btn--small" ng-click="vm.replaceCurrent()" ng-disabled="!vm.search.total">Replace</button>
+        <button type="button" class="btn btn--small" ng-click="vm.requestReplaceAll()" ng-disabled="!vm.search.total">Replace all</button>
+        <span class="confirm" ng-if="vm.search.confirmAll">
+          Replace {{ vm.search.total }} matches?
+          <button type="button" class="btn btn--small btn--primary" ng-click="vm.confirmReplaceAll()">Yes</button>
+          <button type="button" class="btn btn--small" ng-click="vm.cancelReplaceAll()">No</button>
+        </span>
+        <button type="button" class="btn btn--icon btn--small" ng-click="vm.undo()" ng-disabled="!vm.canUndo" title="Undo (Ctrl+Z)"><svg class="ic"><use href="#i-undo"/></svg><span class="sr-only">Undo</span></button>
+        <button type="button" class="btn btn--icon btn--small" ng-click="vm.redo()" ng-disabled="!vm.canRedo" title="Redo (Ctrl+Y)"><svg class="ic"><use href="#i-redo"/></svg><span class="sr-only">Redo</span></button>
+      </div>
+    </div>
+
+    <div class="stats-bar" id="outputStats">
+      <span class="stat"><b>{{ vm.stats.output.chars | number }}</b> chars</span>
+      <span class="stat"><b>{{ vm.stats.output.bytes | number }}</b> bytes</span>
+      <span class="stat"><b>{{ vm.stats.output.lines | number }}</b> lines</span>
+      <span class="stat"><b>{{ vm.stats.output.words | number }}</b> words</span>
+      <span class="stat"><b>{{ vm.stats.output.emptyLines | number }}</b> empty lines</span>
+      <span class="stat"><b>{{ vm.stats.output.longestLine | number }}</b> longest line</span>
+      <span class="stat" title="Leading / trailing whitespace characters"><b>{{ vm.stats.output.leadingWs }}/{{ vm.stats.output.trailingWs }}</b> edge whitespace</span>
+    </div>
+    <div class="editor-wrap">
+      <div id="outputEditor" class="editor"></div>
+      <div class="drop-overlay">Drop a text file to load it here</div>
+    </div>
+    <input type="file" id="fileInputOutput" class="sr-only" tabindex="-1" accept=".json,.xml,.yaml,.yml,.txt,.java" dfi-file-input="vm.handleFiles(files, 'output')">
+  </section>
+</main>
+
+<!-- ============ Analysis ============ -->
+<section class="analysis" id="analysisPanel" aria-label="Analysis">
+  <div class="analysis-header">
+    <h2 class="section-title">Analysis</h2>
+    <div class="segmented" role="group" aria-label="Analyze which panel">
+      <button type="button" id="targetInput" class="seg" ng-class="{active: vm.inspectTarget === 'input'}" ng-click="vm.setInspectTarget('input')">Input</button>
+      <button type="button" id="targetOutput" class="seg" ng-class="{active: vm.inspectTarget === 'output'}" ng-click="vm.setInspectTarget('output')">Output</button>
+    </div>
+    <span class="analysis-meta">{{ vm.analysisMeta }}</span>
+  </div>
+
+  <div class="analysis-grid">
+    <!-- Validation -->
+    <div class="card validation" id="validationPanel" ng-class="'is-' + vm.validation.status">
+      <div class="card-head">
+        <h3>Validation</h3>
+        <span class="status-pill" ng-class="'status--' + vm.validation.status" id="validationStatus">{{ vm.validation.label }}</span>
+      </div>
+      <div class="error-box" ng-if="vm.validation.error">
+        <div class="error-title">Syntax error</div>
+        <div class="error-text">{{ vm.validation.error.message }}</div>
+        <div class="error-loc" ng-if="vm.validation.error.line">Line {{ vm.validation.error.line }}<span ng-if="vm.validation.error.column">, column {{ vm.validation.error.column }}</span></div>
+        <button type="button" id="jumpToErrorBtn" class="btn btn--small" ng-if="vm.validation.error.line" ng-click="vm.jumpToError()">
+          <svg class="ic"><use href="#i-jump"/></svg><span class="btn-label">Jump to error</span>
+        </button>
+      </div>
+      <div class="ok-note" ng-if="vm.validation.status === 'valid'">{{ vm.validation.message }}</div>
+      <div class="idle-note" ng-if="vm.validation.status === 'idle'">{{ vm.validation.message }}</div>
+      <ul class="notice-list" ng-if="vm.validation.warnings.length">
+        <li class="notice notice--warning" ng-repeat="w in vm.validation.warnings track by $index">
+          <span class="notice-kind">Warning</span>{{ w.text }}
+        </li>
+      </ul>
+      <ul class="notice-list" ng-if="vm.conversionNotices.length">
+        <li class="notice" ng-repeat="n in vm.conversionNotices track by $index" ng-class="'notice--' + n.level">
+          <span class="notice-kind">{{ n.level === 'error' ? 'Not converted' : (n.level === 'warning' ? 'Lossy' : 'Note') }}</span>{{ n.text }}
+        </li>
+      </ul>
+    </div>
+
+    <!-- Counters -->
+    <div class="card counters" id="countersPanel">
+      <div class="card-head"><h3>Counters</h3><span class="hint">Select a value counter to list its matches</span></div>
+      <div class="counter-grid">
+        <button type="button" class="counter" ng-repeat="c in vm.counters track by c.key"
+                ng-class="[c.cls, {'is-clickable': c.filter, 'is-active': c.filter && vm.inspectFilter === c.filter, 'is-zero': c.value === 0, 'is-na': c.value === 'N/A', 'is-hot': c.filter && c.value > 0}]"
+                ng-disabled="!c.filter" ng-click="vm.setInspectFilter(c.filter)" ng-attr-title="{{ c.hint }}">
+          <span class="counter-value">{{ c.value }}</span>
+          <span class="counter-label">{{ c.label }}</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Null and empty value inspector -->
+    <div class="card inspector" id="inspectorPanel">
+      <div class="card-head">
+        <h3>Null and empty value inspector</h3>
+        <span class="hint">Read-only. Nothing is changed or removed.</span>
+      </div>
+      <div class="chip-row" role="group" aria-label="Filter results">
+        <button type="button" class="chip" ng-repeat="f in vm.inspectFilters track by f.id" ng-class="[ 'chip--' + f.id, {active: vm.inspectFilter === f.id} ]" ng-click="vm.setInspectFilter(f.id)">
+          {{ f.label }} <span class="chip-count">{{ f.count }}</span>
+        </button>
+      </div>
+      <ul class="inspect-list" id="inspectList" ng-if="vm.visibleItems.length">
+        <li class="inspect-item" ng-repeat="item in vm.visibleItems | limitTo: vm.itemLimit track by $index">
+          <span class="tag" ng-class="'tag--' + item.type">{{ item.typeLabel }}</span>
+          <code class="path">{{ item.path }}</code>
+          <span class="loc">{{ item.line ? 'L' + item.line + ':' + item.column : 'no position' }}</span>
+          <span class="preview">{{ item.preview }}</span>
+          <button type="button" class="btn btn--small" ng-click="vm.jumpToItem(item)" ng-disabled="!item.line" title="Jump to this value">
+            <svg class="ic"><use href="#i-jump"/></svg><span class="btn-label">Jump</span>
+          </button>
+        </li>
+      </ul>
+      <button type="button" class="btn btn--small" ng-if="vm.visibleItems.length > vm.itemLimit" ng-click="vm.showMoreItems()">
+        Show more ({{ vm.visibleItems.length - vm.itemLimit }} remaining)
+      </button>
+      <div class="empty-state" ng-if="!vm.visibleItems.length">{{ vm.inspectionMessage }}</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ Details (collapsible) ============ -->
+<section class="details" id="detailsPanel">
+  <button type="button" class="details-toggle" ng-click="vm.showDetails = !vm.showDetails" ng-attr-aria-expanded="{{ vm.showDetails }}">
+    <svg class="ic"><use ng-attr-href="{{ vm.showDetails ? '#i-up' : '#i-down' }}"/></svg>
+    Counting rules, supported syntax and limitations
+  </button>
+  <div class="details-body" ng-show="vm.showDetails">
+    <div class="details-col">
+      <h4>Counting rules</h4>
+      <ul>
+        <li><b>JSON and YAML:</b> null counts only real null values. The text "null" inside a string is not null. Empty string is <code>""</code>, empty array is <code>[]</code>, empty object is <code>{}</code>.</li>
+        <li><b>XML:</b> there is no native null. An element counts as null only when it has <code>xsi:nil="true"</code>. An empty element has no child nodes or only whitespace, as in <code>&lt;a&gt;&lt;/a&gt;</code> and <code>&lt;a/&gt;</code>. Whitespace-only text nodes are reported separately.</li>
+        <li><b>Java-style:</b> null is the bare token <code>null</code>. Empty strings are <code>""</code> or <code>''</code>. Empty collections are <code>[]</code> or <code>{}</code>. Empty objects are <code>Name{}</code> or <code>Name()</code>.</li>
+        <li>Statistics that do not apply to a format show N/A. A count of 0 means there were none.</li>
+        <li>Paths look like <code>$.users[0].name</code> (JSON, YAML, Java-style) and <code>/root/customer/name</code> (XML).</li>
+      </ul>
+    </div>
+    <div class="details-col">
+      <h4>Limitations</h4>
+      <ul>
+        <li><b>Duplicate JSON keys</b> are found with a custom tokenizer, because <code>JSON.parse</code> silently keeps the last value.</li>
+        <li><b>YAML:</b> js-yaml does not keep comments, and anchor names are regenerated, so the output is rebuilt from the parsed data. Key order is kept, except whole-number keys (such as 10:), which JavaScript lists first.</li>
+        <li><b>XML to JSON</b> is lossy for mixed content, namespaces and repeated elements. <b>JSON to XML</b> needs a single root and valid element names.</li>
+        <li><b>Java-style</b> support covers common <code>toString()</code> patterns only. Ambiguous or unsupported input is reported, not guessed. Input is never evaluated as code.</li>
+        <li>Large inputs are processed on the main thread with debounce. Above a size threshold, Auto mode pauses and asks you to use Manual mode.</li>
+      </ul>
+    </div>
+    <div class="details-col">
+      <h4>Libraries</h4>
+      <ul>
+        <li>AngularJS 1.8.3</li>
+        <li>CodeMirror 5.65.16 (javascript, xml, yaml modes; searchcursor and placeholder addons)</li>
+        <li>js-yaml 4.1.0</li>
+        <li>All from cdnjs. No data is sent anywhere.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer class="app-footer">All processing stays in your browser. Input is never executed as code.</footer>
+
+<!-- Toast -->
+<div class="toast" id="toast" ng-class="'toast--' + vm.toast.type" ng-show="vm.toast.visible" role="status" aria-live="polite">{{ vm.toast.message }}</div>
+
+<!-- External scripts (pinned) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.8.3/angular.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/yaml/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/display/placeholder.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
