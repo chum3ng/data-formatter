@@ -89,10 +89,13 @@
   };
 
   /** Offset -> {line, column, offset}. Lines and columns are 1-based. */
+  var liText = null, liValue = null;     // the last index is reused when the same text is asked for again
   Util.lineIndex = function (text) {
-    var starts = [0], p = -1;
+    var starts, p = -1, result;
+    if (text === liText && liValue) { return liValue; }
+    starts = [0];
     while ((p = text.indexOf('\n', p + 1)) !== -1) { starts.push(p + 1); }
-    return {
+    result = {
       at: function (off) {
         var lo = 0, hi = starts.length - 1, mid;
         while (lo < hi) {
@@ -102,6 +105,8 @@
         return { line: lo + 1, column: off - starts[lo] + 1, offset: off };
       }
     };
+    liText = text; liValue = result;
+    return result;
   };
 
   function isWs(c) {
@@ -165,8 +170,10 @@
     throw { __jsonError: true, message: message, offset: offset };
   }
 
-  Json.parse = function (text) {
-    var n = text.length, i = 0, stack = [], root = null;
+  // opts.from: start parsing at this offset. opts.prefix: stop after the first complete value and
+  // report where it ended ({end}) instead of failing on text that follows (used to find JSON inside logs).
+  Json.parse = function (text, opts) {
+    var n = text.length, i = (opts && opts.from) || 0, stack = [], root = null, prefix = !!(opts && opts.prefix);
 
     function skipWs() {
       var c;
@@ -274,7 +281,7 @@
 
     function run() {
       var state = 'value', c, node, s, top, commaAt;
-      if (text.charCodeAt(0) === 0xFEFF) { i = 1; }
+      if (i === 0 && text.charCodeAt(0) === 0xFEFF) { i = 1; }
       skipWs();
       if (i >= n) { fail('Input is empty: expected a JSON value', 0); }
       while (true) {
@@ -307,7 +314,7 @@
         } else {
           skipWs();
           if (!stack.length) {
-            if (i < n) { fail('Unexpected content after the end of the JSON value', i); }
+            if (i < n && !prefix) { fail('Unexpected content after the end of the JSON value', i); }
             return;
           }
           top = stack[stack.length - 1];
@@ -337,9 +344,10 @@
 
     try {
       run();
-      return { ok: true, root: root, text: text };
+      return { ok: true, root: root, text: text, end: root.e };
     } catch (e) {
       if (e && e.__jsonError) {
+        if (prefix) { return { ok: false, error: { message: e.message, line: 0, column: 0, offset: e.offset } }; }
         var p = Util.lineIndex(text).at(Math.min(e.offset, n));
         return { ok: false, error: { message: e.message, line: p.line, column: p.column, offset: p.offset } };
       }
@@ -1522,8 +1530,10 @@
             map  {t:'map', fields, ...}   untyped {..}
             list {t:'list', type, items, ...}
      ------------------------------------------------------------------ */
-  J.parse = function (text) {
-    var n = text.length, i = 0, stack = [], root = null, warnings = [], warned = Object.create(null);
+  // opts.from / opts.prefix work as in DFI.Json.parse: parse one value starting at an offset and report where it ends.
+  J.parse = function (text, opts) {
+    var n = text.length, i = (opts && opts.from) || 0, stack = [], root = null, warnings = [], warned = Object.create(null);
+    var prefix = !!(opts && opts.prefix);
     var state = 'value', c, top, s, id, commaAt, node, cc;
 
     function warn(key, msg) {
@@ -1666,7 +1676,7 @@
     }
 
     function run() {
-      if (text.charCodeAt(0) === 0xFEFF) { i = 1; }
+      if (i === 0 && text.charCodeAt(0) === 0xFEFF) { i = 1; }
       skipWs();
       if (i >= n) { fail('Input is empty: expected an object, map or list', 0); }
       while (true) {
@@ -1709,7 +1719,7 @@
         } else {
           skipWs();
           if (!stack.length) {
-            if (i < n) { fail('Unexpected content after the end of the value', i); }
+            if (i < n && !prefix) { fail('Unexpected content after the end of the value', i); }
             return;
           }
           if (i >= n) { fail("Unexpected end of input: missing '" + top.close + "'", i); }
@@ -1731,6 +1741,7 @@
       run();
     } catch (e) {
       if (e && e.__javaError) {
+        if (prefix) { return { ok: false, error: { message: e.message, line: 0, column: 0, offset: e.offset } }; }
         var p = Util.lineIndex(text).at(Math.min(e.offset, n));
         return { ok: false, error: { message: e.message, line: p.line, column: p.column, offset: p.offset } };
       }
@@ -1739,7 +1750,7 @@
     if (root.t === 'raw' && /@[0-9a-f]{4,}$/i.test(text.slice(root.s, root.e))) {
       warnings.push('This looks like default Object.toString() output (Class@hash). It contains no field data.');
     }
-    return { ok: true, text: text, root: root, warnings: warnings };
+    return { ok: true, text: text, root: root, warnings: warnings, end: root.e };
   };
 
   /* ------------------------------------------------------------------
@@ -2021,6 +2032,15 @@
      run({parsed, from, to, mode:'beautify'|'minify', indent:'2'|'4'|'tab'})
                                      -> {ok, text, notices[], lossy} | {ok:false, error, notices[]}
 
+   Mixed text (logs): when the input is not one valid document, the JSON and Java-style parts inside it can still be
+   formatted and analyzed, and all other text is left exactly as written.
+     mixedScan(text)                        -> {segments:[{format:'json'|'java', start, end, parsed}], truncated}
+     mixedRender(text, scan, {mode, indent}) -> {text, notices[]}
+     mixedAnalysis(text, scan)              -> analysis for all parts together (paths start with #1, #2, ...; positions are
+                                               offsets in the original text, so Jump works)
+   Parts are found by trying the real parsers at every { [ and Name( Name{ Name[ . Parts that are too trivial
+   (for example [INFO], (x), {id}, a list of plain numbers) are not treated as data. XML and YAML are not searched for.
+
    Supported conversions (everything else is refused with a clear message, never faked):
      JSON <-> YAML, JSON <-> XML, JSON <-> Java object, and each format to itself (beautify, minify).
    Every converted result is parsed again with the target format's engine before it is returned.
@@ -2046,6 +2066,7 @@
   C.label = function (id) {
     var i;
     if (id === 'auto') { return 'Auto-detect'; }
+    if (id === 'mixed') { return 'Mixed text'; }
     for (i = 0; i < C.FORMATS.length; i++) { if (C.FORMATS[i].id === id) { return C.FORMATS[i].label; } }
     return String(id);
   };
@@ -2355,6 +2376,109 @@
       throw e;
     }
   }
+
+
+  /* ------------------------------------------------------------------
+     Mixed text: format the data parts inside logs, keep everything else as written
+     ------------------------------------------------------------------ */
+  var MIXED = { maxSegments: 5000, timeMs: 2500 };
+
+  function worthJson(root) {
+    var k;
+    if (root.t === 'o') { return root.kids.length > 0; }
+    if (root.t === 'a') {
+      for (k = 0; k < root.kids.length; k++) { if (root.kids[k].t === 'o' || root.kids[k].t === 'a') { return true; } }
+    }
+    return false;
+  }
+  function worthJava(root) {
+    var k;
+    if (root.t === 'obj' || root.t === 'map') { return root.fields.length > 0; }
+    if (root.t === 'list') {
+      for (k = 0; k < root.items.length; k++) { if (root.items[k].t === 'obj' || root.items[k].t === 'map') { return true; } }
+    }
+    return false;
+  }
+
+  C.mixedScan = function (text) {
+    var re = /[{\[]|[A-Za-z_$][\w.$]*(?=[{(\[])/g, segs = [], m, idx, ch, r, seg, t0 = Date.now(), truncated = false;
+    while ((m = re.exec(text)) !== null) {
+      idx = m.index; ch = text.charAt(idx); seg = null;
+      if (ch !== '{' && ch !== '[' && idx > 0 && /[\w.$]/.test(text.charAt(idx - 1))) { continue; }   // starts in the middle of a word
+      if (ch === '{' || ch === '[') {
+        r = Json.parse(text, { from: idx, prefix: true });
+        if (r.ok && worthJson(r.root)) { seg = { format: 'json', start: idx, end: r.end, parsed: r }; }
+      }
+      if (!seg) {
+        r = JavaObj.parse(text, { from: idx, prefix: true });
+        if (r.ok && worthJava(r.root)) { seg = { format: 'java', start: idx, end: r.end, parsed: r }; }
+      }
+      if (seg) {
+        segs.push(seg);
+        re.lastIndex = seg.end;
+        if (segs.length >= MIXED.maxSegments) { truncated = true; break; }
+      }
+      if (Date.now() - t0 > MIXED.timeMs) { truncated = true; break; }
+    }
+    return { segments: segs, truncated: truncated };
+  };
+
+  C.mixedRender = function (text, scan, o) {
+    var minify = o.mode === 'minify', unit = Util.indentUnit(o.indent), pieces = [], pos = 0;
+    var counts = { json: 0, java: 0 }, warn = Object.create(null), notices = [], parts = [], total = scan.segments.length;
+    scan.segments.forEach(function (sg) {
+      var f, ls, le;
+      if (sg.format === 'json') {
+        f = minify ? Json.minify(sg.parsed) : Json.beautify(sg.parsed, unit);
+        counts.json++;
+      } else {
+        f = minify ? JavaObj.minify(sg.parsed).text : JavaObj.beautify(sg.parsed, unit).text;
+        counts.java++;
+        sg.parsed.warnings.forEach(function (w) { warn[w] = true; });
+      }
+      pieces.push(text.slice(pos, sg.start));
+      if (!minify) {                                   // keep a formatted block on its own lines
+        ls = text.lastIndexOf('\n', sg.start - 1) + 1;
+        if (text.slice(ls, sg.start).trim() !== '') { pieces.push('\n'); }
+      }
+      pieces.push(f);
+      if (!minify) {
+        le = text.indexOf('\n', sg.end);
+        if (le < 0) { le = text.length; }
+        if (text.slice(sg.end, le).trim() !== '') { pieces.push('\n'); }
+      }
+      pos = sg.end;
+    });
+    pieces.push(text.slice(pos));
+    if (counts.json) { parts.push(counts.json + ' JSON'); }
+    if (counts.java) { parts.push(counts.java + ' Java-style'); }
+    notices.push({ level: 'info', text: 'The input is not one single document, so it was treated as text with data inside it. Formatted ' + parts.join(' and ') + ' part' + (total === 1 ? '' : 's') + '. All other text was left exactly as written.' });
+    if (scan.truncated) { notices.push({ level: 'warning', text: 'The search for parts stopped early (time or count limit), so some parts may not be formatted.' }); }
+    Object.keys(warn).forEach(function (w) { notices.push({ level: 'warning', text: w }); });
+    return { text: pieces.join(''), notices: notices };
+  };
+
+  C.mixedAnalysis = function (text, scan) {
+    var a = Util.newAnalysis(), noted = Object.create(null), keys = Object.keys(a.counts);
+    a.notes = [];
+    scan.segments.forEach(function (sg, k) {
+      var an = sg.format === 'json' ? Json.analyze(sg.parsed) : JavaObj.analyze(sg.parsed), prefix = '#' + (k + 1) + ' ';
+      keys.forEach(function (key) {
+        if (typeof an.counts[key] === 'number') { a.counts[key] = (typeof a.counts[key] === 'number' ? a.counts[key] : 0) + an.counts[key]; }
+      });
+      an.items.forEach(function (it) {
+        if (a.items.length >= Util.LIMITS.maxItems) { a.truncated = true; return; }
+        it.path = prefix + it.path;
+        a.items.push(it);
+      });
+      an.duplicates.forEach(function (d) {
+        if (a.duplicates.length < Util.LIMITS.maxItems) { d.path = prefix + d.path; a.duplicates.push(d); }
+      });
+      (an.notes || []).forEach(function (nt) { if (!noted[nt]) { noted[nt] = true; a.notes.push(nt); } });
+      if (an.truncated) { a.truncated = true; }
+    });
+    return a;
+  };
 
   /* ------------------------------------------------------------------
      run: format, minify or convert
@@ -3034,9 +3158,9 @@
   app.controller('MainController', ['$scope', '$timeout', function ($scope, $timeout) {
     var vm = this;
     var ctx = { $scope: $scope, $timeout: $timeout, cm: {}, hooks: {} };
-    var cache = { input: null, output: null };
+    var cache = { input: null, output: null, mixed: null };
     var silent = { input: false, output: false };
-    var state = { inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', modes: { input: undefined, output: undefined } };
+    var state = { inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', mixedActive: false, modes: { input: undefined, output: undefined } };
 
     /* ---------- small helpers ---------- */
     ctx.apply = function (fn) { $scope.$evalAsync(fn); };
@@ -3315,6 +3439,10 @@
       var side = vm.inspectTarget, text = ctx.cm[side].getValue(), fmt, res, a, c;
       if (!text.trim()) { showNoAnalysis(side, side === 'input' ? 'Paste or type data, or load a sample.' : 'There is no output yet. Click Beautify.'); return; }
       if (side === 'input') {
+        if (state.mixedActive && cache.mixed && cache.mixed.text === text && cache.mixed.analysis) {
+          showAnalysis('input', 'mixed', cache.mixed.analysis);
+          return;
+        }
         c = cache.input;
         if (!c || c.text !== text) { showNoAnalysis(side, 'Click Validate or Beautify to analyze the input.'); return; }
         res = c.res; fmt = c.fmt;
@@ -3322,6 +3450,7 @@
       } else {
         fmt = state.outFmt || state.inFmt || (vm.outputFormat === 'same' ? null : vm.outputFormat);
         if (!fmt) { showNoAnalysis(side, 'The output format is not known yet.'); return; }
+        if (fmt === 'mixed') { showNoAnalysis(side, 'The output is mixed text, so it cannot be analyzed as one document. Switch to Input to inspect the parts.'); return; }
         res = parseCached('output', fmt, text);
         if (!res.ok) { showNoAnalysis(side, 'The output is not valid ' + Convert.label(fmt) + ' (' + res.error.message + ').'); return; }
       }
@@ -3362,6 +3491,7 @@
       vm.canSwap = r.ok; vm.swapHint = r.hint;
     }
     function updateLabels() {
+      if (state.mixedActive) { vm.inputFormatLabel = 'Mixed text'; vm.outputFormatLabel = 'Mixed text'; return; }
       vm.inputFormatLabel = vm.inputFormat === 'auto' ? (state.inFmt ? 'Auto: ' + Convert.label(state.inFmt) : 'Auto-detect') : Convert.label(vm.inputFormat);
       vm.outputFormatLabel = vm.outputFormat === 'same'
         ? (state.outFmt ? Convert.label(state.outFmt) + ' (same as input)' : 'Same as input')
@@ -3373,9 +3503,54 @@
       if (ctx.cm.output.getValue() && (force || !vm.outputEdited)) { ctx.setText('output', ''); }
     }
 
+    /* ---------- mixed text: format the data parts inside logs, leave the rest as written ---------- */
+    function getMixed(text) {
+      var c = cache.mixed, scan;
+      if (c && c.text === text) { return c; }
+      scan = Convert.mixedScan(text);
+      c = { text: text, scan: scan, analysis: scan.segments.length ? Convert.mixedAnalysis(text, scan) : null };
+      cache.mixed = c;
+      return c;
+    }
+
+    function runMixed(text, action, error, inFmt) {
+      var m, n, w = [], r, notices;
+      if (action === 'auto' && text.length > 300000) { return false; }
+      m = getMixed(text);
+      n = m.scan.segments.length;
+      if (!n) { return false; }
+      state.mixedActive = true;
+      if (error) {
+        w.push({ text: 'As one ' + Convert.label(inFmt) + ' document this is not valid: ' + error.message + (error.line ? ' (line ' + error.line + ', column ' + error.column + ')' : '') + '. The valid parts were formatted instead.' });
+      }
+      vm.validation = {
+        status: 'valid', label: 'Partly valid', error: null, warnings: w,
+        message: 'Found ' + n + ' valid part' + (n === 1 ? '' : 's') + ' of structured data inside the text. Text that is not data was left as written.'
+      };
+      vm.dirty = false;
+      state.inFmt = inFmt || null; state.outFmt = 'mixed';
+      updateLabels(); updateSwap(null); applyModes(inFmt, 'mixed');
+      if (action !== 'validate') {
+        if (action === 'auto' && vm.outputEdited) {
+          vm.conversionNotices = [{ level: 'info', text: 'The output was not refreshed because you edited it. Click Beautify or Minify to replace it.' }];
+        } else {
+          r = Convert.mixedRender(text, m.scan, { mode: action === 'auto' ? vm.lastAction : action, indent: vm.settings.indent });
+          ctx.setText('output', r.text);
+          notices = r.notices;
+          if (vm.outputFormat !== 'same') {
+            notices.push({ level: 'info', text: 'Conversion to ' + Convert.label(vm.outputFormat) + ' is not applied to mixed text. Each part keeps its own format.' });
+          }
+          vm.conversionNotices = notices;
+        }
+      }
+      refreshInspection();
+      return true;
+    }
+
     ctx.process = function (action, source) {
       var text = ctx.cm.input.getValue(), inFmt, outFmt, res, analysis, mode, out, notices = [];
       if (action === 'beautify' || action === 'minify') { vm.lastAction = action; }
+      state.mixedActive = false;
       clearErrorMark();
 
       if (action === 'auto' && text.length > Util.LIMITS.autoMaxChars) {
@@ -3394,6 +3569,7 @@
 
       inFmt = effectiveInput(text);
       if (!inFmt) {
+        if (vm.inputFormat === 'auto' && runMixed(text, action, null, null)) { return; }
         setInvalid({ message: 'The format could not be detected. Choose an input format from the list.', line: 0, column: 0 }, null);
         state.inFmt = null; state.outFmt = null; updateLabels(); updateSwap(null);
         showNoAnalysis('input', 'The format could not be detected.');
@@ -3406,6 +3582,7 @@
 
       res = parseCached('input', inFmt, text);
       if (!res.ok) {
+        if ((inFmt === 'json' || inFmt === 'java') && runMixed(text, action, res.error, inFmt)) { return; }
         setInvalid(res.error, vm.inputFormat === 'auto' ? null : Convert.mismatchWarning(vm.inputFormat, text));
         markError(res.error);
         vm.dirty = false;
@@ -3520,7 +3697,7 @@
       ctx.setText('input', '');
       ctx.setText('output', '');
       vm.conversionNotices = [];
-      cache.input = null; cache.output = null;
+      cache.input = null; cache.output = null; cache.mixed = null;
       ctx.emit('reset');
       ctx.process('validate', 'clear');
       ctx.cm.input.focus();
