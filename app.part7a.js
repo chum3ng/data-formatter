@@ -188,9 +188,9 @@
   app.controller('MainController', ['$scope', '$timeout', function ($scope, $timeout) {
     var vm = this;
     var ctx = { $scope: $scope, $timeout: $timeout, cm: {}, hooks: {} };
-    var cache = { input: null, output: null };
+    var cache = { input: null, output: null, mixed: null };
     var silent = { input: false, output: false };
-    var state = { inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', modes: { input: undefined, output: undefined } };
+    var state = { inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', mixedActive: false, modes: { input: undefined, output: undefined } };
 
     /* ---------- small helpers ---------- */
     ctx.apply = function (fn) { $scope.$evalAsync(fn); };
@@ -469,6 +469,10 @@
       var side = vm.inspectTarget, text = ctx.cm[side].getValue(), fmt, res, a, c;
       if (!text.trim()) { showNoAnalysis(side, side === 'input' ? 'Paste or type data, or load a sample.' : 'There is no output yet. Click Beautify.'); return; }
       if (side === 'input') {
+        if (state.mixedActive && cache.mixed && cache.mixed.text === text && cache.mixed.analysis) {
+          showAnalysis('input', 'mixed', cache.mixed.analysis);
+          return;
+        }
         c = cache.input;
         if (!c || c.text !== text) { showNoAnalysis(side, 'Click Validate or Beautify to analyze the input.'); return; }
         res = c.res; fmt = c.fmt;
@@ -476,6 +480,7 @@
       } else {
         fmt = state.outFmt || state.inFmt || (vm.outputFormat === 'same' ? null : vm.outputFormat);
         if (!fmt) { showNoAnalysis(side, 'The output format is not known yet.'); return; }
+        if (fmt === 'mixed') { showNoAnalysis(side, 'The output is mixed text, so it cannot be analyzed as one document. Switch to Input to inspect the parts.'); return; }
         res = parseCached('output', fmt, text);
         if (!res.ok) { showNoAnalysis(side, 'The output is not valid ' + Convert.label(fmt) + ' (' + res.error.message + ').'); return; }
       }
@@ -516,6 +521,7 @@
       vm.canSwap = r.ok; vm.swapHint = r.hint;
     }
     function updateLabels() {
+      if (state.mixedActive) { vm.inputFormatLabel = 'Mixed text'; vm.outputFormatLabel = 'Mixed text'; return; }
       vm.inputFormatLabel = vm.inputFormat === 'auto' ? (state.inFmt ? 'Auto: ' + Convert.label(state.inFmt) : 'Auto-detect') : Convert.label(vm.inputFormat);
       vm.outputFormatLabel = vm.outputFormat === 'same'
         ? (state.outFmt ? Convert.label(state.outFmt) + ' (same as input)' : 'Same as input')
@@ -527,9 +533,54 @@
       if (ctx.cm.output.getValue() && (force || !vm.outputEdited)) { ctx.setText('output', ''); }
     }
 
+    /* ---------- mixed text: format the data parts inside logs, leave the rest as written ---------- */
+    function getMixed(text) {
+      var c = cache.mixed, scan;
+      if (c && c.text === text) { return c; }
+      scan = Convert.mixedScan(text);
+      c = { text: text, scan: scan, analysis: scan.segments.length ? Convert.mixedAnalysis(text, scan) : null };
+      cache.mixed = c;
+      return c;
+    }
+
+    function runMixed(text, action, error, inFmt) {
+      var m, n, w = [], r, notices;
+      if (action === 'auto' && text.length > 300000) { return false; }
+      m = getMixed(text);
+      n = m.scan.segments.length;
+      if (!n) { return false; }
+      state.mixedActive = true;
+      if (error) {
+        w.push({ text: 'As one ' + Convert.label(inFmt) + ' document this is not valid: ' + error.message + (error.line ? ' (line ' + error.line + ', column ' + error.column + ')' : '') + '. The valid parts were formatted instead.' });
+      }
+      vm.validation = {
+        status: 'valid', label: 'Partly valid', error: null, warnings: w,
+        message: 'Found ' + n + ' valid part' + (n === 1 ? '' : 's') + ' of structured data inside the text. Text that is not data was left as written.'
+      };
+      vm.dirty = false;
+      state.inFmt = inFmt || null; state.outFmt = 'mixed';
+      updateLabels(); updateSwap(null); applyModes(inFmt, 'mixed');
+      if (action !== 'validate') {
+        if (action === 'auto' && vm.outputEdited) {
+          vm.conversionNotices = [{ level: 'info', text: 'The output was not refreshed because you edited it. Click Beautify or Minify to replace it.' }];
+        } else {
+          r = Convert.mixedRender(text, m.scan, { mode: action === 'auto' ? vm.lastAction : action, indent: vm.settings.indent });
+          ctx.setText('output', r.text);
+          notices = r.notices;
+          if (vm.outputFormat !== 'same') {
+            notices.push({ level: 'info', text: 'Conversion to ' + Convert.label(vm.outputFormat) + ' is not applied to mixed text. Each part keeps its own format.' });
+          }
+          vm.conversionNotices = notices;
+        }
+      }
+      refreshInspection();
+      return true;
+    }
+
     ctx.process = function (action, source) {
       var text = ctx.cm.input.getValue(), inFmt, outFmt, res, analysis, mode, out, notices = [];
       if (action === 'beautify' || action === 'minify') { vm.lastAction = action; }
+      state.mixedActive = false;
       clearErrorMark();
 
       if (action === 'auto' && text.length > Util.LIMITS.autoMaxChars) {
@@ -548,6 +599,7 @@
 
       inFmt = effectiveInput(text);
       if (!inFmt) {
+        if (vm.inputFormat === 'auto' && runMixed(text, action, null, null)) { return; }
         setInvalid({ message: 'The format could not be detected. Choose an input format from the list.', line: 0, column: 0 }, null);
         state.inFmt = null; state.outFmt = null; updateLabels(); updateSwap(null);
         showNoAnalysis('input', 'The format could not be detected.');
@@ -560,6 +612,7 @@
 
       res = parseCached('input', inFmt, text);
       if (!res.ok) {
+        if ((inFmt === 'json' || inFmt === 'java') && runMixed(text, action, res.error, inFmt)) { return; }
         setInvalid(res.error, vm.inputFormat === 'auto' ? null : Convert.mismatchWarning(vm.inputFormat, text));
         markError(res.error);
         vm.dirty = false;
@@ -674,7 +727,7 @@
       ctx.setText('input', '');
       ctx.setText('output', '');
       vm.conversionNotices = [];
-      cache.input = null; cache.output = null;
+      cache.input = null; cache.output = null; cache.mixed = null;
       ctx.emit('reset');
       ctx.process('validate', 'clear');
       ctx.cm.input.focus();

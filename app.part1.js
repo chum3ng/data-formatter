@@ -89,10 +89,13 @@
   };
 
   /** Offset -> {line, column, offset}. Lines and columns are 1-based. */
+  var liText = null, liValue = null;     // the last index is reused when the same text is asked for again
   Util.lineIndex = function (text) {
-    var starts = [0], p = -1;
+    var starts, p = -1, result;
+    if (text === liText && liValue) { return liValue; }
+    starts = [0];
     while ((p = text.indexOf('\n', p + 1)) !== -1) { starts.push(p + 1); }
-    return {
+    result = {
       at: function (off) {
         var lo = 0, hi = starts.length - 1, mid;
         while (lo < hi) {
@@ -102,6 +105,8 @@
         return { line: lo + 1, column: off - starts[lo] + 1, offset: off };
       }
     };
+    liText = text; liValue = result;
+    return result;
   };
 
   function isWs(c) {
@@ -165,8 +170,10 @@
     throw { __jsonError: true, message: message, offset: offset };
   }
 
-  Json.parse = function (text) {
-    var n = text.length, i = 0, stack = [], root = null;
+  // opts.from: start parsing at this offset. opts.prefix: stop after the first complete value and
+  // report where it ended ({end}) instead of failing on text that follows (used to find JSON inside logs).
+  Json.parse = function (text, opts) {
+    var n = text.length, i = (opts && opts.from) || 0, stack = [], root = null, prefix = !!(opts && opts.prefix);
 
     function skipWs() {
       var c;
@@ -274,7 +281,7 @@
 
     function run() {
       var state = 'value', c, node, s, top, commaAt;
-      if (text.charCodeAt(0) === 0xFEFF) { i = 1; }
+      if (i === 0 && text.charCodeAt(0) === 0xFEFF) { i = 1; }
       skipWs();
       if (i >= n) { fail('Input is empty: expected a JSON value', 0); }
       while (true) {
@@ -307,7 +314,7 @@
         } else {
           skipWs();
           if (!stack.length) {
-            if (i < n) { fail('Unexpected content after the end of the JSON value', i); }
+            if (i < n && !prefix) { fail('Unexpected content after the end of the JSON value', i); }
             return;
           }
           top = stack[stack.length - 1];
@@ -337,9 +344,10 @@
 
     try {
       run();
-      return { ok: true, root: root, text: text };
+      return { ok: true, root: root, text: text, end: root.e };
     } catch (e) {
       if (e && e.__jsonError) {
+        if (prefix) { return { ok: false, error: { message: e.message, line: 0, column: 0, offset: e.offset } }; }
         var p = Util.lineIndex(text).at(Math.min(e.offset, n));
         return { ok: false, error: { message: e.message, line: p.line, column: p.column, offset: p.offset } };
       }

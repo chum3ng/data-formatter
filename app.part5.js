@@ -15,6 +15,15 @@
      run({parsed, from, to, mode:'beautify'|'minify', indent:'2'|'4'|'tab'})
                                      -> {ok, text, notices[], lossy} | {ok:false, error, notices[]}
 
+   Mixed text (logs): when the input is not one valid document, the JSON and Java-style parts inside it can still be
+   formatted and analyzed, and all other text is left exactly as written.
+     mixedScan(text)                        -> {segments:[{format:'json'|'java', start, end, parsed}], truncated}
+     mixedRender(text, scan, {mode, indent}) -> {text, notices[]}
+     mixedAnalysis(text, scan)              -> analysis for all parts together (paths start with #1, #2, ...; positions are
+                                               offsets in the original text, so Jump works)
+   Parts are found by trying the real parsers at every { [ and Name( Name{ Name[ . Parts that are too trivial
+   (for example [INFO], (x), {id}, a list of plain numbers) are not treated as data. XML and YAML are not searched for.
+
    Supported conversions (everything else is refused with a clear message, never faked):
      JSON <-> YAML, JSON <-> XML, JSON <-> Java object, and each format to itself (beautify, minify).
    Every converted result is parsed again with the target format's engine before it is returned.
@@ -40,6 +49,7 @@
   C.label = function (id) {
     var i;
     if (id === 'auto') { return 'Auto-detect'; }
+    if (id === 'mixed') { return 'Mixed text'; }
     for (i = 0; i < C.FORMATS.length; i++) { if (C.FORMATS[i].id === id) { return C.FORMATS[i].label; } }
     return String(id);
   };
@@ -349,6 +359,109 @@
       throw e;
     }
   }
+
+
+  /* ------------------------------------------------------------------
+     Mixed text: format the data parts inside logs, keep everything else as written
+     ------------------------------------------------------------------ */
+  var MIXED = { maxSegments: 5000, timeMs: 2500 };
+
+  function worthJson(root) {
+    var k;
+    if (root.t === 'o') { return root.kids.length > 0; }
+    if (root.t === 'a') {
+      for (k = 0; k < root.kids.length; k++) { if (root.kids[k].t === 'o' || root.kids[k].t === 'a') { return true; } }
+    }
+    return false;
+  }
+  function worthJava(root) {
+    var k;
+    if (root.t === 'obj' || root.t === 'map') { return root.fields.length > 0; }
+    if (root.t === 'list') {
+      for (k = 0; k < root.items.length; k++) { if (root.items[k].t === 'obj' || root.items[k].t === 'map') { return true; } }
+    }
+    return false;
+  }
+
+  C.mixedScan = function (text) {
+    var re = /[{\[]|[A-Za-z_$][\w.$]*(?=[{(\[])/g, segs = [], m, idx, ch, r, seg, t0 = Date.now(), truncated = false;
+    while ((m = re.exec(text)) !== null) {
+      idx = m.index; ch = text.charAt(idx); seg = null;
+      if (ch !== '{' && ch !== '[' && idx > 0 && /[\w.$]/.test(text.charAt(idx - 1))) { continue; }   // starts in the middle of a word
+      if (ch === '{' || ch === '[') {
+        r = Json.parse(text, { from: idx, prefix: true });
+        if (r.ok && worthJson(r.root)) { seg = { format: 'json', start: idx, end: r.end, parsed: r }; }
+      }
+      if (!seg) {
+        r = JavaObj.parse(text, { from: idx, prefix: true });
+        if (r.ok && worthJava(r.root)) { seg = { format: 'java', start: idx, end: r.end, parsed: r }; }
+      }
+      if (seg) {
+        segs.push(seg);
+        re.lastIndex = seg.end;
+        if (segs.length >= MIXED.maxSegments) { truncated = true; break; }
+      }
+      if (Date.now() - t0 > MIXED.timeMs) { truncated = true; break; }
+    }
+    return { segments: segs, truncated: truncated };
+  };
+
+  C.mixedRender = function (text, scan, o) {
+    var minify = o.mode === 'minify', unit = Util.indentUnit(o.indent), pieces = [], pos = 0;
+    var counts = { json: 0, java: 0 }, warn = Object.create(null), notices = [], parts = [], total = scan.segments.length;
+    scan.segments.forEach(function (sg) {
+      var f, ls, le;
+      if (sg.format === 'json') {
+        f = minify ? Json.minify(sg.parsed) : Json.beautify(sg.parsed, unit);
+        counts.json++;
+      } else {
+        f = minify ? JavaObj.minify(sg.parsed).text : JavaObj.beautify(sg.parsed, unit).text;
+        counts.java++;
+        sg.parsed.warnings.forEach(function (w) { warn[w] = true; });
+      }
+      pieces.push(text.slice(pos, sg.start));
+      if (!minify) {                                   // keep a formatted block on its own lines
+        ls = text.lastIndexOf('\n', sg.start - 1) + 1;
+        if (text.slice(ls, sg.start).trim() !== '') { pieces.push('\n'); }
+      }
+      pieces.push(f);
+      if (!minify) {
+        le = text.indexOf('\n', sg.end);
+        if (le < 0) { le = text.length; }
+        if (text.slice(sg.end, le).trim() !== '') { pieces.push('\n'); }
+      }
+      pos = sg.end;
+    });
+    pieces.push(text.slice(pos));
+    if (counts.json) { parts.push(counts.json + ' JSON'); }
+    if (counts.java) { parts.push(counts.java + ' Java-style'); }
+    notices.push({ level: 'info', text: 'The input is not one single document, so it was treated as text with data inside it. Formatted ' + parts.join(' and ') + ' part' + (total === 1 ? '' : 's') + '. All other text was left exactly as written.' });
+    if (scan.truncated) { notices.push({ level: 'warning', text: 'The search for parts stopped early (time or count limit), so some parts may not be formatted.' }); }
+    Object.keys(warn).forEach(function (w) { notices.push({ level: 'warning', text: w }); });
+    return { text: pieces.join(''), notices: notices };
+  };
+
+  C.mixedAnalysis = function (text, scan) {
+    var a = Util.newAnalysis(), noted = Object.create(null), keys = Object.keys(a.counts);
+    a.notes = [];
+    scan.segments.forEach(function (sg, k) {
+      var an = sg.format === 'json' ? Json.analyze(sg.parsed) : JavaObj.analyze(sg.parsed), prefix = '#' + (k + 1) + ' ';
+      keys.forEach(function (key) {
+        if (typeof an.counts[key] === 'number') { a.counts[key] = (typeof a.counts[key] === 'number' ? a.counts[key] : 0) + an.counts[key]; }
+      });
+      an.items.forEach(function (it) {
+        if (a.items.length >= Util.LIMITS.maxItems) { a.truncated = true; return; }
+        it.path = prefix + it.path;
+        a.items.push(it);
+      });
+      an.duplicates.forEach(function (d) {
+        if (a.duplicates.length < Util.LIMITS.maxItems) { d.path = prefix + d.path; a.duplicates.push(d); }
+      });
+      (an.notes || []).forEach(function (nt) { if (!noted[nt]) { noted[nt] = true; a.notes.push(nt); } });
+      if (an.truncated) { a.truncated = true; }
+    });
+    return a;
+  };
 
   /* ------------------------------------------------------------------
      run: format, minify or convert

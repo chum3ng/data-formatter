@@ -56,8 +56,10 @@
             map  {t:'map', fields, ...}   untyped {..}
             list {t:'list', type, items, ...}
      ------------------------------------------------------------------ */
-  J.parse = function (text) {
-    var n = text.length, i = 0, stack = [], root = null, warnings = [], warned = Object.create(null);
+  // opts.from / opts.prefix work as in DFI.Json.parse: parse one value starting at an offset and report where it ends.
+  J.parse = function (text, opts) {
+    var n = text.length, i = (opts && opts.from) || 0, stack = [], root = null, warnings = [], warned = Object.create(null);
+    var prefix = !!(opts && opts.prefix);
     var state = 'value', c, top, s, id, commaAt, node, cc;
 
     function warn(key, msg) {
@@ -200,7 +202,7 @@
     }
 
     function run() {
-      if (text.charCodeAt(0) === 0xFEFF) { i = 1; }
+      if (i === 0 && text.charCodeAt(0) === 0xFEFF) { i = 1; }
       skipWs();
       if (i >= n) { fail('Input is empty: expected an object, map or list', 0); }
       while (true) {
@@ -243,7 +245,7 @@
         } else {
           skipWs();
           if (!stack.length) {
-            if (i < n) { fail('Unexpected content after the end of the value', i); }
+            if (i < n && !prefix) { fail('Unexpected content after the end of the value', i); }
             return;
           }
           if (i >= n) { fail("Unexpected end of input: missing '" + top.close + "'", i); }
@@ -265,6 +267,7 @@
       run();
     } catch (e) {
       if (e && e.__javaError) {
+        if (prefix) { return { ok: false, error: { message: e.message, line: 0, column: 0, offset: e.offset } }; }
         var p = Util.lineIndex(text).at(Math.min(e.offset, n));
         return { ok: false, error: { message: e.message, line: p.line, column: p.column, offset: p.offset } };
       }
@@ -273,7 +276,7 @@
     if (root.t === 'raw' && /@[0-9a-f]{4,}$/i.test(text.slice(root.s, root.e))) {
       warnings.push('This looks like default Object.toString() output (Class@hash). It contains no field data.');
     }
-    return { ok: true, text: text, root: root, warnings: warnings };
+    return { ok: true, text: text, root: root, warnings: warnings, end: root.e };
   };
 
   /* ------------------------------------------------------------------
