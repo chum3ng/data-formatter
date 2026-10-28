@@ -389,7 +389,11 @@
           w.push({ text: 'YAML warning' + (pw.line ? ' (line ' + pw.line + ')' : '') + ': ' + pw.text });
         }
       }
-      vm.validation = { status: 'valid', label: 'Valid', message: 'The input is valid ' + Convert.label(fmt) + '.', error: null, warnings: w };
+      vm.validation = {
+        status: 'valid', error: null, warnings: w,
+        label: res.parsed.fragment ? 'Valid fragment' : 'Valid',
+        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.' : 'The input is valid ' + Convert.label(fmt) + '.'
+      };
     }
     function clearErrorMark() {
       if (state.errHandle) { ctx.cm.input.removeLineClass(state.errHandle, 'background', 'cm-error-line'); state.errHandle = null; }
@@ -543,6 +547,14 @@
       return c;
     }
 
+    // True when the strict error means "data with other text around it" (logs), not a typo inside a document.
+    function isLogLike(error, text) {
+      var first;
+      if (!error) { return true; }
+      first = text.search(/\S/);
+      return error.code === 'outside' || /^Unexpected content after the end/.test(error.message) || (typeof error.offset === 'number' && error.offset >= 0 && error.offset <= first);
+    }
+
     function runMixed(text, action, error, inFmt) {
       var m, n, w = [], r, notices;
       if (action === 'auto' && text.length > 300000) { return false; }
@@ -612,7 +624,7 @@
 
       res = parseCached('input', inFmt, text);
       if (!res.ok) {
-        if ((inFmt === 'json' || inFmt === 'java') && runMixed(text, action, res.error, inFmt)) { return; }
+        if ((inFmt === 'json' || inFmt === 'java' || inFmt === 'xml') && isLogLike(res.error, text) && runMixed(text, action, res.error, inFmt)) { return; }
         setInvalid(res.error, vm.inputFormat === 'auto' ? null : Convert.mismatchWarning(vm.inputFormat, text));
         markError(res.error);
         vm.dirty = false;

@@ -13,6 +13,12 @@
      decodeText(raw)            -> text with &amp; &lt; &#65; etc. decoded (throws {msg} on custom entities)
      escapeText(s), escapeAttr(s), isName(s), firstInvalidChar(s)   (helpers for JSON -> XML in Part 5)
 
+   Fragments: several top-level elements with no single root, for example <A>1</A><B>2</B>, are accepted as an
+   "XML fragment" (parsed.fragment === true). They are formatted, minified and analyzed element by element, and
+   convert to JSON as the keys of one object. Text outside elements is still an error.
+   Prefix mode: parse(text, {from, prefix:true}) reads one element starting at an offset and reports {end}
+   (used to find XML inside logs).
+
    How validation works: a character-level scanner (not regex based) checks well-formedness and
    records source offsets. When the browser provides DOMParser, the document is also parsed with it;
    if the browser finds an error the scanner missed (for example an unbound namespace prefix),
@@ -96,13 +102,14 @@
                  x text {s,e}   d CDATA   c comment   p processing instruction
                  dt DOCTYPE     decl XML declaration
      ------------------------------------------------------------------ */
-  function scan(text) {
-    var n = text.length, i = 0, stack = [], doc = { kids: [] }, root = null, afterRoot = false;
+  function scan(text, opts) {
+    var fragment = !!(opts && opts.fragment), prefix = !!(opts && opts.prefix);
+    var n = text.length, i = (opts && opts.from) || 0, stack = [], doc = { kids: [] }, root = null, afterRoot = false;
     var hasDoctype = false, customEntities = false, maxDepth = 0, parserErrorName = false;
     var bad, parent, c, next, j, k, e, e2, q, ve, lt, name, an, attrs, seen, sc, el, top, end, cd, body, depth, quote, internal;
 
-    function fail(msg, off, rel) {
-      throw { __xmlError: true, message: msg, offset: off, related: rel === undefined ? -1 : rel };
+    function fail(msg, off, rel, code) {
+      throw { __xmlError: true, message: msg, offset: off, related: rel === undefined ? -1 : rel, code: code || '' };
     }
     function nameEnd(p) {
       var ch = text.charCodeAt(p);
@@ -132,11 +139,13 @@
       }
     }
 
-    bad = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/.exec(text);
-    if (bad) { fail('Invalid character U+' + ('0000' + text.charCodeAt(bad.index).toString(16).toUpperCase()).slice(-4) + ' is not allowed in XML', bad.index); }
-    if (text.charCodeAt(0) === 0xFEFF) { i = 1; }
+    if (!prefix) {
+      bad = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/.exec(text);
+      if (bad) { fail('Invalid character U+' + ('0000' + text.charCodeAt(bad.index).toString(16).toUpperCase()).slice(-4) + ' is not allowed in XML', bad.index); }
+    }
+    if (i === 0 && text.charCodeAt(0) === 0xFEFF) { i = 1; }
 
-    if (text.substr(i, 5) === '<?xml' && isWsc(text.charCodeAt(i + 5))) {
+    if (!prefix && text.substr(i, 5) === '<?xml' && isWsc(text.charCodeAt(i + 5))) {
       end = text.indexOf('?>', i);
       if (end === -1) { fail('Unterminated XML declaration', i); }
       doc.kids.push({ t: 'decl', s: i, e: end + 2 });
@@ -144,13 +153,14 @@
     }
 
     while (i < n) {
+      if (prefix && afterRoot) { break; }
       parent = stack.length ? stack[stack.length - 1] : doc;
       c = text.charCodeAt(i);
       if (c !== 60) {
         j = text.indexOf('<', i);
         if (j === -1) { j = n; }
         if (parent === doc) {
-          for (k = i; k < j; k++) { if (!isWsc(text.charCodeAt(k))) { fail('Text is not allowed outside the root element', k); } }
+          for (k = i; k < j; k++) { if (!isWsc(text.charCodeAt(k))) { fail('Text is not allowed outside the root element', k, undefined, 'outside'); } }
         } else {
           checkRefs(i, j);
           cd = text.slice(i, j).indexOf(']]>');
@@ -262,8 +272,8 @@
       }
       el = { t: 'e', n: name, s: i, e: 0, attrs: attrs, sc: sc, kids: [], os: j, cs: -1 };
       if (parent === doc) {
-        if (afterRoot || root) { fail('Only one root element is allowed; a second element starts here', i); }
-        root = el;
+        if ((afterRoot || root) && !fragment) { fail('Only one root element is allowed; a second element starts here', i, undefined, 'multiroot'); }
+        if (!root) { root = el; }
       }
       parent.kids.push(el);
       if (name === 'parsererror') { parserErrorName = true; }
@@ -282,7 +292,13 @@
       fail('Unclosed element <' + top.n + '>: its closing tag is missing', n, top.s);
     }
     if (!root) { fail('No root element found', 0); }
-    return { root: root, doc: doc, hasDoctype: hasDoctype, customEntities: customEntities, maxDepth: maxDepth, parserErrorName: parserErrorName };
+    if (fragment) {
+      var tops = doc.kids.filter(function (kd) { return kd.t === 'e'; });
+      if (tops.length > 1) {      // an implicit wrapper lets analysis and conversion treat the fragment as one tree
+        root = { t: 'e', n: '', implicit: true, s: tops[0].s, e: tops[tops.length - 1].e, attrs: [], sc: false, kids: tops, os: tops[0].s, cs: tops[tops.length - 1].e };
+      }
+    }
+    return { root: root, doc: doc, hasDoctype: hasDoctype, customEntities: customEntities, maxDepth: maxDepth, parserErrorName: parserErrorName, fragment: !!root.implicit };
   }
 
   /* ------------------------------------------------------------------
@@ -318,12 +334,13 @@
     return { message: (body || 'The browser reported an XML error.').trim(), line: line, column: col, offset: line ? offsetOf(text, line, col) : -1 };
   }
 
-  Xml.parse = function (text) {
-    var res, li, p, r, msg, dom;
+  Xml.parse = function (text, opts) {
+    var res, li, p, r, msg, dom, prefix = !!(opts && opts.prefix);
     try {
-      res = scan(text);
+      res = scan(text, opts);
     } catch (e) {
       if (e && e.__xmlError) {
+        if (prefix) { return { ok: false, error: { message: e.message, line: 0, column: 0, offset: e.offset, code: e.code } }; }
         li = Util.lineIndex(text);
         p = li.at(Math.min(e.offset, text.length));
         msg = e.message;
@@ -331,13 +348,16 @@
           r = li.at(e.related);
           msg += ' (the opening tag is at line ' + r.line + ', column ' + r.column + ')';
         }
-        return { ok: false, error: { message: msg, line: p.line, column: p.column, offset: p.offset } };
+        return { ok: false, error: { message: msg, line: p.line, column: p.column, offset: p.offset, code: e.code } };
       }
       throw e;
     }
-    dom = domCheck(text, res);
+    dom = (prefix || res.fragment) ? null : domCheck(text, res);
     if (dom) { return { ok: false, error: dom }; }
-    return { ok: true, text: text, root: res.root, doc: res.doc, hasDoctype: res.hasDoctype, customEntities: res.customEntities, depth: res.maxDepth };
+    return {
+      ok: true, text: text, root: res.root, doc: res.doc, hasDoctype: res.hasDoctype, customEntities: res.customEntities,
+      depth: res.maxDepth, fragment: res.fragment, end: res.root.e
+    };
   };
 
   /* ------------------------------------------------------------------
@@ -513,8 +533,14 @@
       return { el: el, i: 0, path: path, ns: r.ns, names: names, seen: Object.create(null) };
     }
 
-    var rootNs = Object.create(null), r = visit(parsed.root, '/' + parsed.root.n, rootNs);
-    if (r.hasElem) { stack.push(makeFrame(parsed.root, '/' + parsed.root.n, r)); }
+    var rootNs = Object.create(null), r;
+    if (parsed.root.implicit) {
+      stack.push(makeFrame(parsed.root, '', { ns: rootNs }));
+      a.notes.push('This XML has no single root element, so it is treated as a fragment of several top-level elements. A complete XML document needs exactly one root element.');
+    } else {
+      r = visit(parsed.root, '/' + parsed.root.n, rootNs);
+      if (r.hasElem) { stack.push(makeFrame(parsed.root, '/' + parsed.root.n, r)); }
+    }
     while (stack.length) {
       f = stack[stack.length - 1];
       if (f.i >= f.el.kids.length) { stack.pop(); continue; }
@@ -605,8 +631,13 @@
         if (k.t !== 'e') { continue; }
         add(f, k.n, convert(k, f.ns));
       }
-      wrap = Object.create(null);
-      wrap[parsed.root.n] = rootVal;
+      if (parsed.root.implicit) {
+        wrap = rootVal;
+        note('fragment', 'info', 'The XML has several top-level elements and no root, so they became the keys of one JSON object.');
+      } else {
+        wrap = Object.create(null);
+        wrap[parsed.root.n] = rootVal;
+      }
       note('strings', 'info', 'XML has no data types, so every value is a string.');
       return { ok: true, value: wrap, notices: notices };
     } catch (e) {

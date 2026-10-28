@@ -21,8 +21,8 @@
      mixedRender(text, scan, {mode, indent}) -> {text, notices[]}
      mixedAnalysis(text, scan)              -> analysis for all parts together (paths start with #1, #2, ...; positions are
                                                offsets in the original text, so Jump works)
-   Parts are found by trying the real parsers at every { [ and Name( Name{ Name[ . Parts that are too trivial
-   (for example [INFO], (x), {id}, a list of plain numbers) are not treated as data. XML and YAML are not searched for.
+   Parts are found by trying the real parsers at every { [ < and Name( Name{ Name[ . Parts that are too trivial
+   (for example [INFO], (x), {id}, <br/>, a list of plain numbers) are not treated as data. YAML is not searched for.
 
    Supported conversions (everything else is refused with a clear message, never faked):
      JSON <-> YAML, JSON <-> XML, JSON <-> Java object, and each format to itself (beautify, minify).
@@ -121,7 +121,12 @@
   C.parse = function (format, text) {
     var r;
     if (format === 'json') { r = Json.parse(text); }
-    else if (format === 'xml') { r = Xml.parse(text); }
+    else if (format === 'xml') {
+      r = Xml.parse(text);
+      if (!r.ok && r.error.code === 'multiroot') {                     // several top-level elements: accept as a fragment
+        r = Xml.parse(text, { fragment: true });          // a fragment error is the more useful one to report
+      }
+    }
     else if (format === 'yaml') { r = Yaml.parse(text); }
     else if (format === 'java') { r = JavaObj.parse(text); }
     else { return { ok: false, format: format, error: { message: 'Unknown format: ' + format, line: 0, column: 0, offset: -1 } }; }
@@ -383,16 +388,21 @@
     return false;
   }
 
+  function worthXml(root) { return root.kids.length > 0 || root.attrs.length > 0; }
+
   C.mixedScan = function (text) {
-    var re = /[{\[]|[A-Za-z_$][\w.$]*(?=[{(\[])/g, segs = [], m, idx, ch, r, seg, t0 = Date.now(), truncated = false;
+    var re = /[{\[]|[A-Za-z_$][\w.$]*(?=[{(\[])|<(?=[A-Za-z_])/g, segs = [], m, idx, ch, r, seg, t0 = Date.now(), truncated = false;
     while ((m = re.exec(text)) !== null) {
       idx = m.index; ch = text.charAt(idx); seg = null;
       if (ch !== '{' && ch !== '[' && idx > 0 && /[\w.$]/.test(text.charAt(idx - 1))) { continue; }   // starts in the middle of a word
-      if (ch === '{' || ch === '[') {
+      if (ch === '<') {
+        r = Xml.parse(text, { from: idx, prefix: true });
+        if (r.ok && worthXml(r.root)) { seg = { format: 'xml', start: idx, end: r.end, parsed: r }; }
+      } else if (ch === '{' || ch === '[') {
         r = Json.parse(text, { from: idx, prefix: true });
         if (r.ok && worthJson(r.root)) { seg = { format: 'json', start: idx, end: r.end, parsed: r }; }
       }
-      if (!seg) {
+      if (!seg && ch !== '<') {
         r = JavaObj.parse(text, { from: idx, prefix: true });
         if (r.ok && worthJava(r.root)) { seg = { format: 'java', start: idx, end: r.end, parsed: r }; }
       }
@@ -407,11 +417,16 @@
   };
 
   C.mixedRender = function (text, scan, o) {
-    var minify = o.mode === 'minify', unit = Util.indentUnit(o.indent), pieces = [], pos = 0;
-    var counts = { json: 0, java: 0 }, warn = Object.create(null), notices = [], parts = [], total = scan.segments.length;
+    var minify = o.mode === 'minify', unit = Util.indentUnit(o.indent), pieces = [], pos = 0, last = '';
+    function put(str) { if (str) { pieces.push(str); last = str.charAt(str.length - 1); } }
+    var counts = { json: 0, java: 0, xml: 0 }, warn = Object.create(null), notices = [], parts = [], total = scan.segments.length;
     scan.segments.forEach(function (sg) {
       var f, ls, le;
-      if (sg.format === 'json') {
+      if (sg.format === 'xml') {
+        f = minify ? Xml.minify(sg.parsed) : Xml.beautify(sg.parsed, unit);
+        f = f.ok ? f.text : text.slice(sg.start, sg.end);
+        counts.xml++;
+      } else if (sg.format === 'json') {
         f = minify ? Json.minify(sg.parsed) : Json.beautify(sg.parsed, unit);
         counts.json++;
       } else {
@@ -419,23 +434,24 @@
         counts.java++;
         sg.parsed.warnings.forEach(function (w) { warn[w] = true; });
       }
-      pieces.push(text.slice(pos, sg.start));
+      put(text.slice(pos, sg.start));
       if (!minify) {                                   // keep a formatted block on its own lines
         ls = text.lastIndexOf('\n', sg.start - 1) + 1;
-        if (text.slice(ls, sg.start).trim() !== '') { pieces.push('\n'); }
+        if (text.slice(ls, sg.start).trim() !== '' && last !== '\n') { put('\n'); }
       }
-      pieces.push(f);
+      put(f);
       if (!minify) {
         le = text.indexOf('\n', sg.end);
         if (le < 0) { le = text.length; }
-        if (text.slice(sg.end, le).trim() !== '') { pieces.push('\n'); }
+        if (text.slice(sg.end, le).trim() !== '') { put('\n'); }
       }
       pos = sg.end;
     });
-    pieces.push(text.slice(pos));
+    put(text.slice(pos));
     if (counts.json) { parts.push(counts.json + ' JSON'); }
     if (counts.java) { parts.push(counts.java + ' Java-style'); }
-    notices.push({ level: 'info', text: 'The input is not one single document, so it was treated as text with data inside it. Formatted ' + parts.join(' and ') + ' part' + (total === 1 ? '' : 's') + '. All other text was left exactly as written.' });
+    if (counts.xml) { parts.push(counts.xml + ' XML'); }
+    notices.push({ level: 'info', text: 'The input is not one single document, so it was treated as text with data inside it. Formatted ' + parts.join(', ').replace(/, ([^,]*)$/, ' and $1') + ' part' + (total === 1 ? '' : 's') + '. All other text was left exactly as written.' });
     if (scan.truncated) { notices.push({ level: 'warning', text: 'The search for parts stopped early (time or count limit), so some parts may not be formatted.' }); }
     Object.keys(warn).forEach(function (w) { notices.push({ level: 'warning', text: w }); });
     return { text: pieces.join(''), notices: notices };
@@ -445,7 +461,7 @@
     var a = Util.newAnalysis(), noted = Object.create(null), keys = Object.keys(a.counts);
     a.notes = [];
     scan.segments.forEach(function (sg, k) {
-      var an = sg.format === 'json' ? Json.analyze(sg.parsed) : JavaObj.analyze(sg.parsed), prefix = '#' + (k + 1) + ' ';
+      var an = sg.format === 'json' ? Json.analyze(sg.parsed) : (sg.format === 'xml' ? Xml.analyze(sg.parsed) : JavaObj.analyze(sg.parsed)), prefix = '#' + (k + 1) + ' ';
       keys.forEach(function (key) {
         if (typeof an.counts[key] === 'number') { a.counts[key] = (typeof a.counts[key] === 'number' ? a.counts[key] : 0) + an.counts[key]; }
       });
@@ -587,6 +603,11 @@
         '  </ns:customer>',
         '</ns:customers>'
       ].join('\n')
+    },
+    {
+      id: 'xml-fragment', format: 'xml', label: 'XML: fragment with no root element',
+      // Expected: valid fragment, 5 fields, 5 text nodes
+      text: '<AMOUNT>25.01</AMOUNT><SERVICETYPE>CASHOUTBR</SERVICETYPE><INITIATEEWINGID>00750097</INITIATEEWINGID><INITIATERWINGID>05895228</INITIATERWINGID><MSISDN>9222484645</MSISDN>'
     },
     {
       id: 'xml-bad', format: 'xml', label: 'XML: invalid (mismatched closing tag)',

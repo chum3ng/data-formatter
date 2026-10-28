@@ -868,6 +868,12 @@
      decodeText(raw)            -> text with &amp; &lt; &#65; etc. decoded (throws {msg} on custom entities)
      escapeText(s), escapeAttr(s), isName(s), firstInvalidChar(s)   (helpers for JSON -> XML in Part 5)
 
+   Fragments: several top-level elements with no single root, for example <A>1</A><B>2</B>, are accepted as an
+   "XML fragment" (parsed.fragment === true). They are formatted, minified and analyzed element by element, and
+   convert to JSON as the keys of one object. Text outside elements is still an error.
+   Prefix mode: parse(text, {from, prefix:true}) reads one element starting at an offset and reports {end}
+   (used to find XML inside logs).
+
    How validation works: a character-level scanner (not regex based) checks well-formedness and
    records source offsets. When the browser provides DOMParser, the document is also parsed with it;
    if the browser finds an error the scanner missed (for example an unbound namespace prefix),
@@ -951,13 +957,14 @@
                  x text {s,e}   d CDATA   c comment   p processing instruction
                  dt DOCTYPE     decl XML declaration
      ------------------------------------------------------------------ */
-  function scan(text) {
-    var n = text.length, i = 0, stack = [], doc = { kids: [] }, root = null, afterRoot = false;
+  function scan(text, opts) {
+    var fragment = !!(opts && opts.fragment), prefix = !!(opts && opts.prefix);
+    var n = text.length, i = (opts && opts.from) || 0, stack = [], doc = { kids: [] }, root = null, afterRoot = false;
     var hasDoctype = false, customEntities = false, maxDepth = 0, parserErrorName = false;
     var bad, parent, c, next, j, k, e, e2, q, ve, lt, name, an, attrs, seen, sc, el, top, end, cd, body, depth, quote, internal;
 
-    function fail(msg, off, rel) {
-      throw { __xmlError: true, message: msg, offset: off, related: rel === undefined ? -1 : rel };
+    function fail(msg, off, rel, code) {
+      throw { __xmlError: true, message: msg, offset: off, related: rel === undefined ? -1 : rel, code: code || '' };
     }
     function nameEnd(p) {
       var ch = text.charCodeAt(p);
@@ -987,11 +994,13 @@
       }
     }
 
-    bad = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/.exec(text);
-    if (bad) { fail('Invalid character U+' + ('0000' + text.charCodeAt(bad.index).toString(16).toUpperCase()).slice(-4) + ' is not allowed in XML', bad.index); }
-    if (text.charCodeAt(0) === 0xFEFF) { i = 1; }
+    if (!prefix) {
+      bad = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/.exec(text);
+      if (bad) { fail('Invalid character U+' + ('0000' + text.charCodeAt(bad.index).toString(16).toUpperCase()).slice(-4) + ' is not allowed in XML', bad.index); }
+    }
+    if (i === 0 && text.charCodeAt(0) === 0xFEFF) { i = 1; }
 
-    if (text.substr(i, 5) === '<?xml' && isWsc(text.charCodeAt(i + 5))) {
+    if (!prefix && text.substr(i, 5) === '<?xml' && isWsc(text.charCodeAt(i + 5))) {
       end = text.indexOf('?>', i);
       if (end === -1) { fail('Unterminated XML declaration', i); }
       doc.kids.push({ t: 'decl', s: i, e: end + 2 });
@@ -999,13 +1008,14 @@
     }
 
     while (i < n) {
+      if (prefix && afterRoot) { break; }
       parent = stack.length ? stack[stack.length - 1] : doc;
       c = text.charCodeAt(i);
       if (c !== 60) {
         j = text.indexOf('<', i);
         if (j === -1) { j = n; }
         if (parent === doc) {
-          for (k = i; k < j; k++) { if (!isWsc(text.charCodeAt(k))) { fail('Text is not allowed outside the root element', k); } }
+          for (k = i; k < j; k++) { if (!isWsc(text.charCodeAt(k))) { fail('Text is not allowed outside the root element', k, undefined, 'outside'); } }
         } else {
           checkRefs(i, j);
           cd = text.slice(i, j).indexOf(']]>');
@@ -1117,8 +1127,8 @@
       }
       el = { t: 'e', n: name, s: i, e: 0, attrs: attrs, sc: sc, kids: [], os: j, cs: -1 };
       if (parent === doc) {
-        if (afterRoot || root) { fail('Only one root element is allowed; a second element starts here', i); }
-        root = el;
+        if ((afterRoot || root) && !fragment) { fail('Only one root element is allowed; a second element starts here', i, undefined, 'multiroot'); }
+        if (!root) { root = el; }
       }
       parent.kids.push(el);
       if (name === 'parsererror') { parserErrorName = true; }
@@ -1137,7 +1147,13 @@
       fail('Unclosed element <' + top.n + '>: its closing tag is missing', n, top.s);
     }
     if (!root) { fail('No root element found', 0); }
-    return { root: root, doc: doc, hasDoctype: hasDoctype, customEntities: customEntities, maxDepth: maxDepth, parserErrorName: parserErrorName };
+    if (fragment) {
+      var tops = doc.kids.filter(function (kd) { return kd.t === 'e'; });
+      if (tops.length > 1) {      // an implicit wrapper lets analysis and conversion treat the fragment as one tree
+        root = { t: 'e', n: '', implicit: true, s: tops[0].s, e: tops[tops.length - 1].e, attrs: [], sc: false, kids: tops, os: tops[0].s, cs: tops[tops.length - 1].e };
+      }
+    }
+    return { root: root, doc: doc, hasDoctype: hasDoctype, customEntities: customEntities, maxDepth: maxDepth, parserErrorName: parserErrorName, fragment: !!root.implicit };
   }
 
   /* ------------------------------------------------------------------
@@ -1173,12 +1189,13 @@
     return { message: (body || 'The browser reported an XML error.').trim(), line: line, column: col, offset: line ? offsetOf(text, line, col) : -1 };
   }
 
-  Xml.parse = function (text) {
-    var res, li, p, r, msg, dom;
+  Xml.parse = function (text, opts) {
+    var res, li, p, r, msg, dom, prefix = !!(opts && opts.prefix);
     try {
-      res = scan(text);
+      res = scan(text, opts);
     } catch (e) {
       if (e && e.__xmlError) {
+        if (prefix) { return { ok: false, error: { message: e.message, line: 0, column: 0, offset: e.offset, code: e.code } }; }
         li = Util.lineIndex(text);
         p = li.at(Math.min(e.offset, text.length));
         msg = e.message;
@@ -1186,13 +1203,16 @@
           r = li.at(e.related);
           msg += ' (the opening tag is at line ' + r.line + ', column ' + r.column + ')';
         }
-        return { ok: false, error: { message: msg, line: p.line, column: p.column, offset: p.offset } };
+        return { ok: false, error: { message: msg, line: p.line, column: p.column, offset: p.offset, code: e.code } };
       }
       throw e;
     }
-    dom = domCheck(text, res);
+    dom = (prefix || res.fragment) ? null : domCheck(text, res);
     if (dom) { return { ok: false, error: dom }; }
-    return { ok: true, text: text, root: res.root, doc: res.doc, hasDoctype: res.hasDoctype, customEntities: res.customEntities, depth: res.maxDepth };
+    return {
+      ok: true, text: text, root: res.root, doc: res.doc, hasDoctype: res.hasDoctype, customEntities: res.customEntities,
+      depth: res.maxDepth, fragment: res.fragment, end: res.root.e
+    };
   };
 
   /* ------------------------------------------------------------------
@@ -1368,8 +1388,14 @@
       return { el: el, i: 0, path: path, ns: r.ns, names: names, seen: Object.create(null) };
     }
 
-    var rootNs = Object.create(null), r = visit(parsed.root, '/' + parsed.root.n, rootNs);
-    if (r.hasElem) { stack.push(makeFrame(parsed.root, '/' + parsed.root.n, r)); }
+    var rootNs = Object.create(null), r;
+    if (parsed.root.implicit) {
+      stack.push(makeFrame(parsed.root, '', { ns: rootNs }));
+      a.notes.push('This XML has no single root element, so it is treated as a fragment of several top-level elements. A complete XML document needs exactly one root element.');
+    } else {
+      r = visit(parsed.root, '/' + parsed.root.n, rootNs);
+      if (r.hasElem) { stack.push(makeFrame(parsed.root, '/' + parsed.root.n, r)); }
+    }
     while (stack.length) {
       f = stack[stack.length - 1];
       if (f.i >= f.el.kids.length) { stack.pop(); continue; }
@@ -1460,8 +1486,13 @@
         if (k.t !== 'e') { continue; }
         add(f, k.n, convert(k, f.ns));
       }
-      wrap = Object.create(null);
-      wrap[parsed.root.n] = rootVal;
+      if (parsed.root.implicit) {
+        wrap = rootVal;
+        note('fragment', 'info', 'The XML has several top-level elements and no root, so they became the keys of one JSON object.');
+      } else {
+        wrap = Object.create(null);
+        wrap[parsed.root.n] = rootVal;
+      }
       note('strings', 'info', 'XML has no data types, so every value is a string.');
       return { ok: true, value: wrap, notices: notices };
     } catch (e) {
@@ -2038,8 +2069,8 @@
      mixedRender(text, scan, {mode, indent}) -> {text, notices[]}
      mixedAnalysis(text, scan)              -> analysis for all parts together (paths start with #1, #2, ...; positions are
                                                offsets in the original text, so Jump works)
-   Parts are found by trying the real parsers at every { [ and Name( Name{ Name[ . Parts that are too trivial
-   (for example [INFO], (x), {id}, a list of plain numbers) are not treated as data. XML and YAML are not searched for.
+   Parts are found by trying the real parsers at every { [ < and Name( Name{ Name[ . Parts that are too trivial
+   (for example [INFO], (x), {id}, <br/>, a list of plain numbers) are not treated as data. YAML is not searched for.
 
    Supported conversions (everything else is refused with a clear message, never faked):
      JSON <-> YAML, JSON <-> XML, JSON <-> Java object, and each format to itself (beautify, minify).
@@ -2138,7 +2169,12 @@
   C.parse = function (format, text) {
     var r;
     if (format === 'json') { r = Json.parse(text); }
-    else if (format === 'xml') { r = Xml.parse(text); }
+    else if (format === 'xml') {
+      r = Xml.parse(text);
+      if (!r.ok && r.error.code === 'multiroot') {                     // several top-level elements: accept as a fragment
+        r = Xml.parse(text, { fragment: true });          // a fragment error is the more useful one to report
+      }
+    }
     else if (format === 'yaml') { r = Yaml.parse(text); }
     else if (format === 'java') { r = JavaObj.parse(text); }
     else { return { ok: false, format: format, error: { message: 'Unknown format: ' + format, line: 0, column: 0, offset: -1 } }; }
@@ -2400,16 +2436,21 @@
     return false;
   }
 
+  function worthXml(root) { return root.kids.length > 0 || root.attrs.length > 0; }
+
   C.mixedScan = function (text) {
-    var re = /[{\[]|[A-Za-z_$][\w.$]*(?=[{(\[])/g, segs = [], m, idx, ch, r, seg, t0 = Date.now(), truncated = false;
+    var re = /[{\[]|[A-Za-z_$][\w.$]*(?=[{(\[])|<(?=[A-Za-z_])/g, segs = [], m, idx, ch, r, seg, t0 = Date.now(), truncated = false;
     while ((m = re.exec(text)) !== null) {
       idx = m.index; ch = text.charAt(idx); seg = null;
       if (ch !== '{' && ch !== '[' && idx > 0 && /[\w.$]/.test(text.charAt(idx - 1))) { continue; }   // starts in the middle of a word
-      if (ch === '{' || ch === '[') {
+      if (ch === '<') {
+        r = Xml.parse(text, { from: idx, prefix: true });
+        if (r.ok && worthXml(r.root)) { seg = { format: 'xml', start: idx, end: r.end, parsed: r }; }
+      } else if (ch === '{' || ch === '[') {
         r = Json.parse(text, { from: idx, prefix: true });
         if (r.ok && worthJson(r.root)) { seg = { format: 'json', start: idx, end: r.end, parsed: r }; }
       }
-      if (!seg) {
+      if (!seg && ch !== '<') {
         r = JavaObj.parse(text, { from: idx, prefix: true });
         if (r.ok && worthJava(r.root)) { seg = { format: 'java', start: idx, end: r.end, parsed: r }; }
       }
@@ -2424,11 +2465,16 @@
   };
 
   C.mixedRender = function (text, scan, o) {
-    var minify = o.mode === 'minify', unit = Util.indentUnit(o.indent), pieces = [], pos = 0;
-    var counts = { json: 0, java: 0 }, warn = Object.create(null), notices = [], parts = [], total = scan.segments.length;
+    var minify = o.mode === 'minify', unit = Util.indentUnit(o.indent), pieces = [], pos = 0, last = '';
+    function put(str) { if (str) { pieces.push(str); last = str.charAt(str.length - 1); } }
+    var counts = { json: 0, java: 0, xml: 0 }, warn = Object.create(null), notices = [], parts = [], total = scan.segments.length;
     scan.segments.forEach(function (sg) {
       var f, ls, le;
-      if (sg.format === 'json') {
+      if (sg.format === 'xml') {
+        f = minify ? Xml.minify(sg.parsed) : Xml.beautify(sg.parsed, unit);
+        f = f.ok ? f.text : text.slice(sg.start, sg.end);
+        counts.xml++;
+      } else if (sg.format === 'json') {
         f = minify ? Json.minify(sg.parsed) : Json.beautify(sg.parsed, unit);
         counts.json++;
       } else {
@@ -2436,23 +2482,24 @@
         counts.java++;
         sg.parsed.warnings.forEach(function (w) { warn[w] = true; });
       }
-      pieces.push(text.slice(pos, sg.start));
+      put(text.slice(pos, sg.start));
       if (!minify) {                                   // keep a formatted block on its own lines
         ls = text.lastIndexOf('\n', sg.start - 1) + 1;
-        if (text.slice(ls, sg.start).trim() !== '') { pieces.push('\n'); }
+        if (text.slice(ls, sg.start).trim() !== '' && last !== '\n') { put('\n'); }
       }
-      pieces.push(f);
+      put(f);
       if (!minify) {
         le = text.indexOf('\n', sg.end);
         if (le < 0) { le = text.length; }
-        if (text.slice(sg.end, le).trim() !== '') { pieces.push('\n'); }
+        if (text.slice(sg.end, le).trim() !== '') { put('\n'); }
       }
       pos = sg.end;
     });
-    pieces.push(text.slice(pos));
+    put(text.slice(pos));
     if (counts.json) { parts.push(counts.json + ' JSON'); }
     if (counts.java) { parts.push(counts.java + ' Java-style'); }
-    notices.push({ level: 'info', text: 'The input is not one single document, so it was treated as text with data inside it. Formatted ' + parts.join(' and ') + ' part' + (total === 1 ? '' : 's') + '. All other text was left exactly as written.' });
+    if (counts.xml) { parts.push(counts.xml + ' XML'); }
+    notices.push({ level: 'info', text: 'The input is not one single document, so it was treated as text with data inside it. Formatted ' + parts.join(', ').replace(/, ([^,]*)$/, ' and $1') + ' part' + (total === 1 ? '' : 's') + '. All other text was left exactly as written.' });
     if (scan.truncated) { notices.push({ level: 'warning', text: 'The search for parts stopped early (time or count limit), so some parts may not be formatted.' }); }
     Object.keys(warn).forEach(function (w) { notices.push({ level: 'warning', text: w }); });
     return { text: pieces.join(''), notices: notices };
@@ -2462,7 +2509,7 @@
     var a = Util.newAnalysis(), noted = Object.create(null), keys = Object.keys(a.counts);
     a.notes = [];
     scan.segments.forEach(function (sg, k) {
-      var an = sg.format === 'json' ? Json.analyze(sg.parsed) : JavaObj.analyze(sg.parsed), prefix = '#' + (k + 1) + ' ';
+      var an = sg.format === 'json' ? Json.analyze(sg.parsed) : (sg.format === 'xml' ? Xml.analyze(sg.parsed) : JavaObj.analyze(sg.parsed)), prefix = '#' + (k + 1) + ' ';
       keys.forEach(function (key) {
         if (typeof an.counts[key] === 'number') { a.counts[key] = (typeof a.counts[key] === 'number' ? a.counts[key] : 0) + an.counts[key]; }
       });
@@ -2604,6 +2651,11 @@
         '  </ns:customer>',
         '</ns:customers>'
       ].join('\n')
+    },
+    {
+      id: 'xml-fragment', format: 'xml', label: 'XML: fragment with no root element',
+      // Expected: valid fragment, 5 fields, 5 text nodes
+      text: '<AMOUNT>25.01</AMOUNT><SERVICETYPE>CASHOUTBR</SERVICETYPE><INITIATEEWINGID>00750097</INITIATEEWINGID><INITIATERWINGID>05895228</INITIATERWINGID><MSISDN>9222484645</MSISDN>'
     },
     {
       id: 'xml-bad', format: 'xml', label: 'XML: invalid (mismatched closing tag)',
@@ -3359,7 +3411,11 @@
           w.push({ text: 'YAML warning' + (pw.line ? ' (line ' + pw.line + ')' : '') + ': ' + pw.text });
         }
       }
-      vm.validation = { status: 'valid', label: 'Valid', message: 'The input is valid ' + Convert.label(fmt) + '.', error: null, warnings: w };
+      vm.validation = {
+        status: 'valid', error: null, warnings: w,
+        label: res.parsed.fragment ? 'Valid fragment' : 'Valid',
+        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.' : 'The input is valid ' + Convert.label(fmt) + '.'
+      };
     }
     function clearErrorMark() {
       if (state.errHandle) { ctx.cm.input.removeLineClass(state.errHandle, 'background', 'cm-error-line'); state.errHandle = null; }
@@ -3513,6 +3569,14 @@
       return c;
     }
 
+    // True when the strict error means "data with other text around it" (logs), not a typo inside a document.
+    function isLogLike(error, text) {
+      var first;
+      if (!error) { return true; }
+      first = text.search(/\S/);
+      return error.code === 'outside' || /^Unexpected content after the end/.test(error.message) || (typeof error.offset === 'number' && error.offset >= 0 && error.offset <= first);
+    }
+
     function runMixed(text, action, error, inFmt) {
       var m, n, w = [], r, notices;
       if (action === 'auto' && text.length > 300000) { return false; }
@@ -3582,7 +3646,7 @@
 
       res = parseCached('input', inFmt, text);
       if (!res.ok) {
-        if ((inFmt === 'json' || inFmt === 'java') && runMixed(text, action, res.error, inFmt)) { return; }
+        if ((inFmt === 'json' || inFmt === 'java' || inFmt === 'xml') && isLogLike(res.error, text) && runMixed(text, action, res.error, inFmt)) { return; }
         setInvalid(res.error, vm.inputFormat === 'auto' ? null : Convert.mismatchWarning(vm.inputFormat, text));
         markError(res.error);
         vm.dirty = false;
