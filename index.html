@@ -363,7 +363,7 @@
         <li><b>YAML:</b> js-yaml does not keep comments, and anchor names are regenerated, so the output is rebuilt from the parsed data. Key order is kept, except whole-number keys (such as 10:), which JavaScript lists first.</li>
         <li><b>XML to JSON</b> is lossy for mixed content, namespaces and repeated elements. <b>JSON to XML</b> needs a single root and valid element names.</li>
         <li><b>Java-style</b> support covers common <code>toString()</code> patterns only. Ambiguous or unsupported input is reported, not guessed. Input is never evaluated as code.</li>
-        <li><b>SQL:</b> checked as text (unterminated strings, names and comments, unbalanced parentheses), not against your database or the full grammar. Formatting uses the dialect you choose in Settings, and a result is discarded if it would change anything but whitespace and keyword case. SQL cannot be converted to other formats.</li>
+        <li><b>SQL:</b> checked as text (unterminated strings, names and comments, unbalanced parentheses), not against your database or the full grammar. Formatting uses the dialect you choose in Settings. If that dialect cannot read a query (for example the PostgreSQL operator ~ in Standard SQL), the other dialects are tried and the result says which one was used. A result is discarded if it would change anything but whitespace and keyword case. SQL cannot be converted to other formats.</li>
         <li>Large inputs are processed on the main thread with debounce. Above a size threshold (about 100,000 characters for SQL), Auto mode pauses and asks you to use Manual mode.</li>
       </ul>
     </div>

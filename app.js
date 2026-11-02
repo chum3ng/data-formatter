@@ -2063,6 +2063,10 @@
    comments; unbalanced parentheses). It does NOT check the SQL grammar, table names or types, because that
    needs your database. The formatter also rejects text it cannot read, and then reports where.
 
+   Dialect fallback: if the chosen dialect cannot read a query (for example the PostgreSQL operator ~ in Standard SQL),
+   the other dialects are tried, PostgreSQL first, and the first one that formats it safely is used. The result says
+   which dialect was used. (Skipped for scripts over 150,000 characters.)
+
    Safety net: after formatting, the result is read again and every token (words, strings, numbers,
    operators, comments) is compared with the input. If anything other than whitespace and keyword case
    differs, the result is discarded and an error is shown instead of a changed query.
@@ -2251,20 +2255,30 @@
   /* ------------------------------------------------------------------
      beautify (sql-formatter) and minify
      ------------------------------------------------------------------ */
-  function formatterError(e, text, dialect) {
+  function formatterError(e, dialect) {
     var raw = String((e && e.message) || 'The SQL could not be formatted.').split('\n')[0], m = /line (\d+) column (\d+)/.exec(raw);
     return {
-      message: raw.replace(/^Parse error:\s*/, 'The formatter could not read this SQL: ') + ' Try another SQL dialect in Settings.',
+      message: raw.replace(/^Parse error:\s*/, 'The formatter could not read this SQL: '),
       line: m ? +m[1] : 0, column: m ? +m[2] : 0, offset: -1, dialect: dialect
     };
   }
 
-  Sql.beautify = function (parsed, o) {
-    var dialect = (o && o.dialect) || parsed.dialect || 'sql', indent = (o && o.indent) || '2', out, re, d, tk;
-    if (!Sql.available()) {
-      return { ok: false, error: { message: 'The SQL library (sql-formatter) did not load. Check your connection or CDN access, then reload the page.', line: 0, column: 0, offset: -1 } };
+  function dialectLabel(id) {
+    var i;
+    for (i = 0; i < Sql.DIALECTS.length; i++) { if (Sql.DIALECTS[i].id === id) { return Sql.DIALECTS[i].label; } }
+    return id;
+  }
+
+  var FALLBACK_ORDER = ['postgresql', 'mysql', 'mariadb', 'transactsql', 'plsql', 'sqlite', 'db2', 'bigquery', 'snowflake', 'redshift', 'spark', 'trino', 'sql'];
+  var FALLBACK_MAX_CHARS = 150000;
+
+  // Format with one dialect and check that nothing but whitespace and keyword case changed.
+  function tryFormat(parsed, dialect, o) {
+    var indent = (o && o.indent) || '2', src = parsed, out, re, d, tk;
+    if (dialect !== parsed.dialect) {                         // other dialects can tokenize a few things differently
+      src = Sql.parse(parsed.text, { dialect: dialect });
+      if (!src.ok) { return { ok: false, error: src.error }; }
     }
-    if (!parsed.tokens.length) { return { ok: true, text: parsed.text, notices: [] }; }
     try {
       out = global.sqlFormatter.format(parsed.text, {
         language: dialect, tabWidth: indent === '4' ? 4 : 2, useTabs: indent === 'tab',
@@ -2272,21 +2286,50 @@
         expressionWidth: 50, linesBetweenQueries: 1, denseOperators: false, newlineBeforeSemicolon: false
       });
     } catch (e) {
-      return { ok: false, error: formatterError(e, parsed.text, dialect) };
+      return { ok: false, error: formatterError(e, dialect) };
     }
     re = Sql.parse(out, { dialect: dialect });
     if (!re.ok) {
-      return { ok: false, error: { message: 'The formatter produced SQL that does not read back correctly (' + re.error.message + '), so the result was discarded. Try another SQL dialect in Settings.', line: 0, column: 0, offset: -1 } };
+      return { ok: false, error: { message: 'The formatter produced SQL that does not read back correctly (' + re.error.message + ').', line: 0, column: 0, offset: -1 } };
     }
-    d = firstDifference(parsed.text, parsed.tokens, out, re.tokens);
+    d = firstDifference(parsed.text, src.tokens, out, re.tokens);
     if (d >= 0) {
-      tk = parsed.tokens[d];
+      tk = src.tokens[d];
       return { ok: false, error: {
-        message: 'The formatter changed the content of the SQL' + (tk ? ' near "' + Util.truncate(parsed.text.slice(tk.s, tk.e), 30) + '"' : '') + ', so the result was discarded instead of showing a changed query. Try another SQL dialect in Settings.',
+        message: 'The formatter would change the content of the SQL' + (tk ? ' near "' + Util.truncate(parsed.text.slice(tk.s, tk.e), 30) + '"' : '') + ', so that result was discarded.',
         line: 0, column: 0, offset: tk ? tk.s : -1
       } };
     }
-    return { ok: true, text: out.replace(/\s+$/, '') + '\n', notices: [] };
+    return { ok: true, text: out.replace(/\s+$/, '') + '\n' };
+  }
+
+  Sql.beautify = function (parsed, o) {
+    var dialect = (o && o.dialect) || parsed.dialect || 'sql', first, r, i, cand, tried = {};
+    if (!Sql.available()) {
+      return { ok: false, error: { message: 'The SQL library (sql-formatter) did not load. Check your connection or CDN access, then reload the page.', line: 0, column: 0, offset: -1 } };
+    }
+    if (!parsed.tokens.length) { return { ok: true, text: parsed.text, notices: [] }; }
+    first = tryFormat(parsed, dialect, o);
+    if (first.ok) { return { ok: true, text: first.text, notices: [], dialect: dialect }; }
+    tried[dialect] = true;
+    if (parsed.text.length <= FALLBACK_MAX_CHARS) {
+      for (i = 0; i < FALLBACK_ORDER.length; i++) {
+        cand = FALLBACK_ORDER[i];
+        if (tried[cand]) { continue; }
+        tried[cand] = true;
+        r = tryFormat(parsed, cand, o);
+        if (r.ok) {
+          return {
+            ok: true, text: r.text, dialect: cand,
+            notices: [{ level: 'info', text: dialectLabel(dialect) + ' rules could not read this query (' + first.error.message.replace(/^The formatter could not read this SQL:\s*/, '').replace(/\.$/, '') + '), so ' + dialectLabel(cand) + ' rules were used. Choose ' + dialectLabel(cand) + ' in Settings to use them every time.' }]
+          };
+        }
+      }
+    }
+    first.error.message += parsed.text.length <= FALLBACK_MAX_CHARS
+      ? ' No other supported dialect could read it either, so the SQL may use syntax the formatter does not know.'
+      : ' Try another SQL dialect in Settings (the other dialects are not tried automatically for scripts this large).';
+    return { ok: false, error: first.error };
   };
 
   Sql.minify = function (parsed) {
