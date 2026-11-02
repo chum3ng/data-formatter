@@ -164,7 +164,7 @@
      Files
      ------------------------------------------------------------------ */
   var F = DFI.Files = {};
-  F.ACCEPT = ['.json', '.xml', '.yaml', '.yml', '.txt', '.java'];
+  F.ACCEPT = ['.json', '.xml', '.yaml', '.yml', '.txt', '.java', '.sql'];
   F.MAX_BYTES = 20 * 1024 * 1024;
 
   function extOf(name) {
@@ -178,22 +178,23 @@
     if (e === '.xml') { return 'xml'; }
     if (e === '.yaml' || e === '.yml') { return 'yaml'; }
     if (e === '.java') { return 'java'; }
+    if (e === '.sql') { return 'sql'; }
     return null;                                   // .txt: detect from the content
   };
 
   // Java-style output is plain text, not Java source, so it is saved as .txt.
   F.extensionFor = function (format) {
-    return { json: '.json', xml: '.xml', yaml: '.yaml', java: '.txt' }[format] || '.txt';
+    return { json: '.json', xml: '.xml', yaml: '.yaml', java: '.txt', sql: '.sql' }[format] || '.txt';
   };
   F.mimeFor = function (format) {
-    return { json: 'application/json', xml: 'application/xml', yaml: 'application/x-yaml', java: 'text/plain' }[format] || 'text/plain';
+    return { json: 'application/json', xml: 'application/xml', yaml: 'application/x-yaml', java: 'text/plain', sql: 'application/sql' }[format] || 'text/plain';
   };
   F.fileName = function (side, format) { return side + F.extensionFor(format); };
 
   F.validate = function (file) {
     var e = extOf(file.name);
     if (F.ACCEPT.indexOf(e) < 0) {
-      return { ok: false, message: 'Unsupported file type "' + (e || 'no extension') + '". Use .json, .xml, .yaml, .yml, .txt or .java.' };
+      return { ok: false, message: 'Unsupported file type "' + (e || 'no extension') + '". Use .json, .xml, .yaml, .yml, .sql, .txt or .java.' };
     }
     if (!file.size) { return { ok: false, message: 'The file "' + file.name + '" is empty.' }; }
     if (file.size > F.MAX_BYTES) {

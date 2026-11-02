@@ -234,7 +234,7 @@
       m = /^<[^>]*>/.exec(rest)                                                    // XML start tag
         || /^(?:[A-Za-z_$][\w.$]*)?[\[{(]\s*[\]})]/.exec(rest)                      // [] {} Name{} Name()
         || /^(?:""|'')/.exec(rest)                                                  // empty quoted string
-        || /^(?:null|~)(?![\w])/.exec(rest);                                        // null
+        || /^(?:null|~)(?![\w])/i.exec(rest);                                       // null
       return { line: from.line, ch: from.ch + (m ? m[0].length : Math.min(1, Math.max(rest.length, 1))) };
     }
 

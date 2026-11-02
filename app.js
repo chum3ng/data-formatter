@@ -41,7 +41,7 @@
       counts: {
         fields: na, objects: na, arrays: na, nulls: na, emptyStrings: na,
         emptyArrays: na, emptyObjects: na, emptyElements: na, duplicateKeys: na,
-        attributes: na, textNodes: na, whitespaceTexts: na
+        attributes: na, textNodes: na, whitespaceTexts: na, statements: na, comments: na
       },
       items: [],        // {type, typeLabel, path, line, column, offset, preview}
       duplicates: [],   // {path, key, line, column, offset}
@@ -2048,6 +2048,344 @@
 /* ===================== END OF PART 4 ===================== */
 /* ======================================================================
    Data Formatter & Inspector - app.js
+   PART 4b of 7: SQL engine (uses sql-formatter 15.9.0 from the CDN)
+   BEGINS: the comment block headed "PART 4b of 7" (paste right after "END OF PART 4").
+   ENDS:   the line "END OF PART 4b".
+
+   Registers DFI.Sql:
+     DIALECTS, CASES, mimeFor(dialect), available()
+     parse(text, {dialect})              -> {ok, text, tokens, dialect} | {ok:false, error:{message,line,column,offset}}
+     beautify(parsed, {dialect, indent, keywordCase}) -> {ok, text, notices} | {ok:false, error}
+     minify(parsed)                      -> {ok, text, notices}
+     analyze(parsed)                     -> analysis (same shape as the other engines, plus notes[])
+
+   What "valid" means for SQL: the tool checks the text itself (unterminated strings, quoted names and
+   comments; unbalanced parentheses). It does NOT check the SQL grammar, table names or types, because that
+   needs your database. The formatter also rejects text it cannot read, and then reports where.
+
+   Safety net: after formatting, the result is read again and every token (words, strings, numbers,
+   operators, comments) is compared with the input. If anything other than whitespace and keyword case
+   differs, the result is discarded and an error is shown instead of a changed query.
+
+   SQL counting rules:
+   - statements = non-empty statements separated by ; (approximate for procedures with BEGIN ... END)
+   - comments   = line comments (--), block comments, and for MySQL # comments
+   - nulls      = the NULL keyword used as a value. IS NULL, IS NOT NULL and NOT NULL are tests or constraints
+                  and are not counted.
+   - emptyStrings = '' literals. Everything else (fields, objects, arrays ...) is N/A for SQL.
+   Warnings: "= NULL" in WHERE/ON/HAVING/WHEN is never true; UPDATE or DELETE with no WHERE changes every row.
+   ====================================================================== */
+(function (global) {
+  'use strict';
+
+  var DFI = global.DFI, Util = DFI.Util, Sql = DFI.Sql = {};
+
+  Sql.DIALECTS = [
+    { id: 'sql', label: 'Standard SQL' }, { id: 'postgresql', label: 'PostgreSQL' }, { id: 'mysql', label: 'MySQL' },
+    { id: 'mariadb', label: 'MariaDB' }, { id: 'sqlite', label: 'SQLite' }, { id: 'transactsql', label: 'SQL Server (T-SQL)' },
+    { id: 'plsql', label: 'Oracle (PL/SQL)' }, { id: 'db2', label: 'IBM Db2' }, { id: 'bigquery', label: 'BigQuery' },
+    { id: 'snowflake', label: 'Snowflake' }, { id: 'redshift', label: 'Amazon Redshift' }, { id: 'spark', label: 'Spark SQL' },
+    { id: 'trino', label: 'Trino' }
+  ];
+  Sql.CASES = [{ id: 'upper', label: 'UPPERCASE' }, { id: 'lower', label: 'lowercase' }, { id: 'preserve', label: 'As written' }];
+
+  Sql.mimeFor = function (dialect) {
+    return { postgresql: 'text/x-pgsql', redshift: 'text/x-pgsql', mysql: 'text/x-mysql', mariadb: 'text/x-mariadb',
+      sqlite: 'text/x-sqlite', transactsql: 'text/x-mssql', plsql: 'text/x-plsql', db2: 'text/x-sql' }[dialect] || 'text/x-sql';
+  };
+
+  Sql.available = function () { return !!(global.sqlFormatter && global.sqlFormatter.format); };
+
+  /* ------------------------------------------------------------------
+     Tokenizer (character level). Token types:
+       c comment  s string  q quoted name  w word  n number  o operator  p punctuation ( ) , ; .
+     ------------------------------------------------------------------ */
+  function isSpace(c) { return c === 32 || (c >= 9 && c <= 13) || c === 0xA0 || c === 0xFEFF; }
+  function isDigit(c) { return c >= 48 && c <= 57; }
+  function isWordStart(c) { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c >= 0x80; }
+  function isWordChar(c) { return isWordStart(c) || isDigit(c) || c === 36; }
+  var OPCHARS = '+-*/%<>=!~^&|#@?:\\';
+  var DOLLAR = /\$([A-Za-z_\u0080-\uFFFF][\w\u0080-\uFFFF]*)?\$/y;
+  var NUMBER = /(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/y;
+
+  function tokenize(text, dialect) {
+    var n = text.length, i = 0, toks = [], parens = [], c, j, q, esc, m, tag, start, depth, prev, end;
+    var mysql = dialect === 'mysql' || dialect === 'mariadb';
+    var bsDefault = mysql || dialect === 'bigquery' || dialect === 'snowflake' || dialect === 'spark' || dialect === 'hive';
+    var nestedComments = dialect === 'postgresql' || dialect === 'redshift';
+
+    function fail(msg, off) { throw { __sqlError: true, message: msg, offset: off }; }
+    function push(t, s, e) { var tk = { t: t, s: s, e: e }; toks.push(tk); return tk; }
+
+    function scanQuoted(open, closeCh, allowBackslash, what) {
+      var k = open + 1, ch;
+      while (true) {
+        if (k >= n) { fail('Unterminated ' + what + ' (the closing ' + String.fromCharCode(closeCh) + ' is missing)', open); }
+        ch = text.charCodeAt(k);
+        if (allowBackslash && ch === 92) { k += 2; continue; }
+        if (ch === closeCh) {
+          if (text.charCodeAt(k + 1) === closeCh) { k += 2; continue; }    // doubled quote is an escaped quote
+          return k + 1;
+        }
+        k++;
+      }
+    }
+
+    while (i < n) {
+      c = text.charCodeAt(i);
+      if (isSpace(c)) { i++; continue; }
+
+      if (c === 45 && text.charCodeAt(i + 1) === 45) {                                  // -- comment
+        j = text.indexOf('\n', i); if (j < 0) { j = n; }
+        push('c', i, j).k = 'line'; i = j; continue;
+      }
+      if (c === 35 && mysql) {                                                           // # comment (MySQL)
+        j = text.indexOf('\n', i); if (j < 0) { j = n; }
+        push('c', i, j).k = 'line'; i = j; continue;
+      }
+      if (c === 47 && text.charCodeAt(i + 1) === 42) {                                  // /* comment */
+        depth = 1; j = i + 2;
+        while (j < n && depth > 0) {
+          if (nestedComments && text.charCodeAt(j) === 47 && text.charCodeAt(j + 1) === 42) { depth++; j += 2; }
+          else if (text.charCodeAt(j) === 42 && text.charCodeAt(j + 1) === 47) { depth--; j += 2; }
+          else { j++; }
+        }
+        if (depth > 0) { fail('Unterminated /* comment (the closing */ is missing)', i); }
+        push('c', i, j).k = 'block'; i = j; continue;
+      }
+      if (c === 39) {                                                                    // 'string'
+        prev = toks[toks.length - 1];
+        esc = bsDefault || !!(prev && prev.t === 'w' && prev.e === i && (text.charCodeAt(prev.s) | 32) === 101 && prev.e - prev.s === 1);   // E'...'
+        end = scanQuoted(i, 39, esc, 'string');
+        push('s', i, end); i = end; continue;
+      }
+      if (c === 34) {                                                                    // "quoted name"
+        end = scanQuoted(i, 34, mysql || dialect === 'bigquery', 'quoted name');
+        push('q', i, end); i = end; continue;
+      }
+      if (c === 96) {                                                                    // `quoted name`
+        end = scanQuoted(i, 96, false, 'quoted name');
+        push('q', i, end); i = end; continue;
+      }
+      if (c === 91 && dialect === 'transactsql') {                                      // [quoted name]
+        end = scanQuoted(i, 93, false, 'bracketed name');
+        // scanQuoted starts after the opener and looks for the closer; the opener itself is not doubled
+        push('q', i, end); i = end; continue;
+      }
+      if (c === 36) {                                                                    // $$dollar quoted$$ or $1
+        DOLLAR.lastIndex = i;
+        m = DOLLAR.exec(text);
+        if (m && m.index === i) {
+          tag = m[0];
+          j = text.indexOf(tag, i + tag.length);
+          if (j < 0) { fail('Unterminated dollar-quoted string (the closing ' + tag + ' is missing)', i); }
+          push('s', i, j + tag.length).k = 'dollar'; i = j + tag.length; continue;
+        }
+        j = i + 1;
+        while (j < n && isDigit(text.charCodeAt(j))) { j++; }
+        if (j > i + 1) { push('w', i, j); i = j; continue; }
+        push('o', i, i + 1); i++; continue;
+      }
+      if (isDigit(c) || (c === 46 && isDigit(text.charCodeAt(i + 1)))) {                // number
+        NUMBER.lastIndex = i; m = NUMBER.exec(text); j = i + m[0].length;
+        while (j < n && isWordChar(text.charCodeAt(j))) { j++; }                          // 0xFF, 10px ...
+        push('n', i, j); i = j; continue;
+      }
+      if (isWordStart(c)) {
+        j = i + 1;
+        while (j < n && isWordChar(text.charCodeAt(j))) { j++; }
+        push('w', i, j); i = j; continue;
+      }
+      if (c === 40) { start = push('p', i, i + 1); parens.push(start); i++; continue; }
+      if (c === 41) {
+        if (!parens.length) { fail('Unmatched closing parenthesis ")" (there is no "(" for it)', i); }
+        parens.pop(); push('p', i, i + 1); i++; continue;
+      }
+      if (c === 44 || c === 59 || c === 46) { push('p', i, i + 1); i++; continue; }
+      if (OPCHARS.indexOf(text.charAt(i)) >= 0) {
+        j = i + 1;
+        while (j < n && OPCHARS.indexOf(text.charAt(j)) >= 0 &&
+               !(text.charCodeAt(j) === 45 && text.charCodeAt(j + 1) === 45) &&
+               !(text.charCodeAt(j) === 47 && text.charCodeAt(j + 1) === 42)) { j++; }
+        push('o', i, j); i = j; continue;
+      }
+      push('o', i, i + 1); i++;                                                          // any other character
+    }
+    if (parens.length) { fail('Unclosed parenthesis "(" (its ")" is missing)', parens[0].s); }
+    return toks;
+  }
+
+  Sql.parse = function (text, opts) {
+    var dialect = (opts && opts.dialect) || 'sql', toks, p;
+    try {
+      toks = tokenize(text, dialect);
+    } catch (e) {
+      if (e && e.__sqlError) {
+        p = Util.lineIndex(text).at(Math.min(e.offset, text.length));
+        return { ok: false, error: { message: e.message, line: p.line, column: p.column, offset: p.offset } };
+      }
+      throw e;
+    }
+    return { ok: true, text: text, tokens: toks, dialect: dialect };
+  };
+
+  /* ------------------------------------------------------------------
+     Comparing token streams (the safety net)
+     ------------------------------------------------------------------ */
+  function norm(text, tk) {
+    var v = text.slice(tk.s, tk.e);
+    if (tk.t === 'w') { return v.toLowerCase(); }
+    if (tk.t === 'c') { return tk.k === 'line' ? v.replace(/\s+$/, '') : v.replace(/\s+/g, ' '); }
+    return v;
+  }
+
+  // Returns -1 when the streams match, else the index of the first token that differs.
+  function firstDifference(textA, toksA, textB, toksB) {
+    var i, len = Math.max(toksA.length, toksB.length);
+    for (i = 0; i < len; i++) {
+      if (!toksA[i] || !toksB[i] || toksA[i].t !== toksB[i].t || norm(textA, toksA[i]) !== norm(textB, toksB[i])) { return i; }
+    }
+    return -1;
+  }
+
+  /* ------------------------------------------------------------------
+     beautify (sql-formatter) and minify
+     ------------------------------------------------------------------ */
+  function formatterError(e, text, dialect) {
+    var raw = String((e && e.message) || 'The SQL could not be formatted.').split('\n')[0], m = /line (\d+) column (\d+)/.exec(raw);
+    return {
+      message: raw.replace(/^Parse error:\s*/, 'The formatter could not read this SQL: ') + ' Try another SQL dialect in Settings.',
+      line: m ? +m[1] : 0, column: m ? +m[2] : 0, offset: -1, dialect: dialect
+    };
+  }
+
+  Sql.beautify = function (parsed, o) {
+    var dialect = (o && o.dialect) || parsed.dialect || 'sql', indent = (o && o.indent) || '2', out, re, d, tk;
+    if (!Sql.available()) {
+      return { ok: false, error: { message: 'The SQL library (sql-formatter) did not load. Check your connection or CDN access, then reload the page.', line: 0, column: 0, offset: -1 } };
+    }
+    if (!parsed.tokens.length) { return { ok: true, text: parsed.text, notices: [] }; }
+    try {
+      out = global.sqlFormatter.format(parsed.text, {
+        language: dialect, tabWidth: indent === '4' ? 4 : 2, useTabs: indent === 'tab',
+        keywordCase: (o && o.keywordCase) || 'upper', indentStyle: 'standard', logicalOperatorNewline: 'before',
+        expressionWidth: 50, linesBetweenQueries: 1, denseOperators: false, newlineBeforeSemicolon: false
+      });
+    } catch (e) {
+      return { ok: false, error: formatterError(e, parsed.text, dialect) };
+    }
+    re = Sql.parse(out, { dialect: dialect });
+    if (!re.ok) {
+      return { ok: false, error: { message: 'The formatter produced SQL that does not read back correctly (' + re.error.message + '), so the result was discarded. Try another SQL dialect in Settings.', line: 0, column: 0, offset: -1 } };
+    }
+    d = firstDifference(parsed.text, parsed.tokens, out, re.tokens);
+    if (d >= 0) {
+      tk = parsed.tokens[d];
+      return { ok: false, error: {
+        message: 'The formatter changed the content of the SQL' + (tk ? ' near "' + Util.truncate(parsed.text.slice(tk.s, tk.e), 30) + '"' : '') + ', so the result was discarded instead of showing a changed query. Try another SQL dialect in Settings.',
+        line: 0, column: 0, offset: tk ? tk.s : -1
+      } };
+    }
+    return { ok: true, text: out.replace(/\s+$/, '') + '\n', notices: [] };
+  };
+
+  Sql.minify = function (parsed) {
+    var text = parsed.text, out = [], prev = null, removed = 0, keep, tk, v, i, space, re, d;
+    for (i = 0; i < parsed.tokens.length; i++) {
+      tk = parsed.tokens[i];
+      v = text.slice(tk.s, tk.e);
+      if (tk.t === 'c') {
+        keep = tk.k === 'block' && (v.charAt(2) === '+' || v.charAt(2) === '!');     // optimizer hints and MySQL conditional comments
+        if (!keep) { removed++; continue; }
+      }
+      // Tokens that touched each other in the input stay touching (E'..', U&'..', a::int, :name). Otherwise one space.
+      space = prev !== null && prev.e !== tk.s && !(prev.v === '(' || prev.v === '.' || v === ')' || v === ',' || v === ';' || v === '.');
+      if (space) { out.push(' '); }
+      out.push(v);
+      prev = { v: v, e: tk.e };
+    }
+    re = Sql.parse(out.join(''), { dialect: parsed.dialect });
+    if (!re.ok) { return { ok: false, error: { message: 'The minified SQL did not read back correctly, so it was not produced.', line: 0, column: 0, offset: -1 } }; }
+    d = firstDifference(text, parsed.tokens.filter(function (t) {
+      return t.t !== 'c' || (t.k === 'block' && (text.charAt(t.s + 2) === '+' || text.charAt(t.s + 2) === '!'));
+    }), re.text, re.tokens);
+    if (d >= 0) { return { ok: false, error: { message: 'Minifying would change the SQL, so it was not produced.', line: 0, column: 0, offset: -1 } }; }
+    return {
+      ok: true, text: re.text,
+      notices: removed ? [{ level: 'info', text: removed + ' comment' + (removed === 1 ? ' was' : 's were') + ' removed. Optimizer hints (/*+ ... */) and MySQL /*! ... */ comments were kept.' }] : []
+    };
+  };
+
+  /* ------------------------------------------------------------------
+     analyze
+     ------------------------------------------------------------------ */
+  var CLAUSES = { SELECT: 1, FROM: 1, WHERE: 1, JOIN: 1, ON: 1, GROUP: 1, ORDER: 1, HAVING: 1, SET: 1, VALUES: 1, INSERT: 1,
+    UPDATE: 1, DELETE: 1, USING: 1, RETURNING: 1, LIMIT: 1, UNION: 1, WITH: 1, WHEN: 1, THEN: 1, ELSE: 1 };
+  var COMPARE_CLAUSES = { WHERE: 1, ON: 1, HAVING: 1, WHEN: 1 };
+
+  Sql.analyze = function (parsed) {
+    var a = Util.newAnalysis(), c = a.counts, text = parsed.text, toks = parsed.tokens, li = null;
+    var stmt = 0, inStmt = false, first = '', hasWhere = false, clause = '', depth = 0, prev = null, prevU = '';
+    var nullCompare = 0, tk, u, v, i, nextTk, lineStart, lineEnd, s0, e0, ps, nulls = 0;
+    var noteList = [], unsafe = [];
+    c.statements = 0; c.comments = 0; c.nulls = 0; c.emptyStrings = 0;
+    a.notes = [];
+
+    function pos(off) { li = li || Util.lineIndex(text); return li.at(off); }
+    function where() { return 'statement ' + stmt + (clause ? ' \u00B7 ' + clause : ''); }
+    function preview(t) {
+      lineStart = text.lastIndexOf('\n', t.s - 1) + 1;
+      lineEnd = text.indexOf('\n', t.e); if (lineEnd < 0) { lineEnd = text.length; }
+      s0 = Math.max(lineStart, t.s - 18); e0 = Math.min(lineEnd, t.e + 18);
+      return text.slice(s0, e0).trim();
+    }
+    function endStmt() {
+      if (inStmt && (first === 'UPDATE' || first === 'DELETE') && !hasWhere) { unsafe.push('Statement ' + stmt + ' (' + first + ') has no WHERE clause, so it changes every row.'); }
+      inStmt = false; first = ''; hasWhere = false; clause = ''; depth = 0;
+    }
+
+    for (i = 0; i < toks.length; i++) {
+      tk = toks[i];
+      if (tk.t === 'c') { c.comments++; continue; }
+      v = text.slice(tk.s, tk.e);
+      if (tk.t === 'p' && v === ';' && depth === 0) { endStmt(); prev = tk; prevU = ''; continue; }
+      if (!inStmt) {
+        inStmt = true; stmt++;
+        first = tk.t === 'w' ? v.toUpperCase() : '';
+      }
+      if (tk.t === 'p') { if (v === '(') { depth++; } else if (v === ')') { depth--; } }
+      u = tk.t === 'w' ? v.toUpperCase() : '';
+      if (u && CLAUSES[u]) { clause = u; if (u === 'WHERE' && depth === 0) { hasWhere = true; } }
+      if (u === 'NULL') {
+        if (prev && prev.t === 'o' && /^(?:=|<>|!=)$/.test(text.slice(prev.s, prev.e)) && COMPARE_CLAUSES[clause]) {
+          nullCompare++;
+          if (noteList.length < 10) { ps = pos(tk.s); noteList.push('Line ' + ps.line + ': "' + text.slice(prev.s, prev.e) + ' NULL" is never true in SQL. Use IS NULL or IS NOT NULL.'); }
+        }
+        if (!(prev && prev.t === 'w' && (prevU === 'IS' || prevU === 'NOT'))) {
+          c.nulls++;
+          Util.pushItem(a, 'null', where(), pos(tk.s), preview(tk));
+        }
+      } else if (tk.t === 's' && tk.e - tk.s === 2 && text.charAt(tk.s) === "'") {
+        c.emptyStrings++;
+        Util.pushItem(a, 'emptyString', where(), pos(tk.s), preview(tk));
+      }
+      prev = tk; prevU = u;
+    }
+    endStmt();
+    c.statements = stmt;
+    a.notes = noteList.concat(unsafe.slice(0, 10));
+    if (nullCompare > noteList.length) { a.notes.push('And ' + (nullCompare - noteList.length) + ' more comparisons with NULL.'); }
+    if (unsafe.length > 10) { a.notes.push('And ' + (unsafe.length - 10) + ' more statements without WHERE.'); }
+    if (/\bcreate\s+(?:or\s+replace\s+)?(?:definer\s*=\s*\S+\s+)?(?:function|procedure|trigger)\b/i.test(text) || /^\s*(?:begin|declare)\b/im.test(text)) {
+      a.notes.push('This looks like procedural SQL (BEGIN ... END, functions or triggers), so the statement count is approximate.');
+    }
+    return a;
+  };
+
+})(window);
+/* ===================== END OF PART 4b ===================== */
+/* ======================================================================
+   Data Formatter & Inspector - app.js
    PART 5 of 7: Format detection, conversions and sample data
    BEGINS: the comment block headed "PART 5 of 7" (paste right after "END OF PART 4").
    ENDS:   the line "END OF PART 5".
@@ -2074,6 +2412,7 @@
 
    Supported conversions (everything else is refused with a clear message, never faked):
      JSON <-> YAML, JSON <-> XML, JSON <-> Java object, and each format to itself (beautify, minify).
+     SQL only formats to SQL (beautify, minify). run() takes {sql:{dialect, keywordCase}} for it.
    Every converted result is parsed again with the target format's engine before it is returned.
 
    JSON -> XML rules: a one-key object becomes the root element, otherwise <root> is added;
@@ -2092,7 +2431,8 @@
     { id: 'json', label: 'JSON' },
     { id: 'xml', label: 'XML' },
     { id: 'yaml', label: 'YAML' },
-    { id: 'java', label: 'Java object' }
+    { id: 'java', label: 'Java object' },
+    { id: 'sql', label: 'SQL' }
   ];
   C.label = function (id) {
     var i;
@@ -2103,7 +2443,7 @@
   };
 
   var PATHS = {
-    'json>json': 1, 'xml>xml': 1, 'yaml>yaml': 1, 'java>java': 1,
+    'json>json': 1, 'xml>xml': 1, 'yaml>yaml': 1, 'java>java': 1, 'sql>sql': 1,
     'json>xml': 1, 'json>yaml': 1, 'yaml>json': 1, 'xml>json': 1, 'json>java': 1, 'java>json': 1
   };
   var LOSSY = {
@@ -2116,7 +2456,7 @@
   C.supports = function (from, to) { return !!PATHS[from + '>' + to]; };
 
   C.unsupportedMessage = function (from, to) {
-    return 'Converting ' + C.label(from) + ' to ' + C.label(to) + ' is not supported. Supported: JSON \u21C4 YAML, JSON \u21C4 XML and JSON \u21C4 Java object. To go between other formats, convert to JSON first.';
+    return 'Converting ' + C.label(from) + ' to ' + C.label(to) + ' is not supported. Supported: JSON \u21C4 YAML, JSON \u21C4 XML and JSON \u21C4 Java object. SQL can only be formatted as SQL. To go between other formats, convert to JSON first.';
   };
 
   C.canSwap = function (from, to) {
@@ -2128,8 +2468,19 @@
   /* ------------------------------------------------------------------
      Format detection (a quick look at the start of the text, not a full parse)
      ------------------------------------------------------------------ */
+  // How sure we are that the text starts like a SQL statement. Plain English that starts with "update" is not matched.
+  function sqlConfidence(head) {
+    var h = head.replace(/^\s*(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*/, '');
+    if (/^insert\s+(?:or\s+\w+\s+|ignore\s+)?into\s+\S/i.test(h) || /^update\s+(?:only\s+)?[\w."`\[\]]+\s+(?:as\s+\w+\s+)?set\s/i.test(h) ||
+        /^delete\s+from\s+\S/i.test(h) || /^truncate\s+(?:table\s+)?\S/i.test(h) || /^merge\s+into\s+\S/i.test(h) ||
+        /^(?:create|alter|drop)\s+(?:or\s+replace\s+)?(?:(?:global\s+|local\s+)?temp(?:orary)?\s+|unique\s+|materialized\s+|virtual\s+|external\s+)*(?:table|view|index|database|schema|sequence|function|procedure|trigger|type|extension)\b/i.test(h) ||
+        /^with\s+(?:recursive\s+)?[\w"`]+\s*(?:\([^)]*\))?\s+as\s*\(/i.test(h) || /^explain\s+(?:analyze\s+)?select\b/i.test(h) ||
+        /^(?:grant|revoke)\s+[\w ,]+\s+on\s/i.test(h) || /^select\s+[\s\S]*?\bfrom\s+\S/i.test(h)) { return 'high'; }
+    return /^select\s+[\w*'"`(]/i.test(h) ? 'low' : null;
+  }
+
   C.detect = function (text) {
-    var s = text.replace(/^\uFEFF/, '').trim(), head, c;
+    var s = text.replace(/^\uFEFF/, '').trim(), head, c, sc;
     if (!s) { return { format: 'unknown', confidence: 'low', reason: 'empty' }; }
     head = s.slice(0, 4000);
     c = s.charAt(0);
@@ -2147,6 +2498,8 @@
       if (/^\[\s*(?:["{\[\-\d]|true\b|false\b|null\b|\])/.test(head)) { return { format: 'json', confidence: 'high', reason: 'array' }; }
       return { format: 'yaml', confidence: 'low', reason: 'flow sequence' };
     }
+    sc = sqlConfidence(head);
+    if (sc) { return { format: 'sql', confidence: sc, reason: 'starts like a SQL statement' }; }
     if (/^[A-Za-z_][\w.]*[{(\[]/.test(head)) { return { format: 'java', confidence: 'high', reason: 'Name{...} object' }; }
     if (/^---/.test(head) || /^[ \t]*[\w"'.\-][^\n:]*:(?:[ \t]|$)/m.test(head) || /^[ \t]*-[ \t]+\S/m.test(head)) {
       return { format: 'yaml', confidence: 'high', reason: 'key: value or list lines' };
@@ -2166,7 +2519,7 @@
   /* ------------------------------------------------------------------
      parse / analyze dispatch
      ------------------------------------------------------------------ */
-  C.parse = function (format, text) {
+  C.parse = function (format, text, o) {
     var r;
     if (format === 'json') { r = Json.parse(text); }
     else if (format === 'xml') {
@@ -2177,6 +2530,7 @@
     }
     else if (format === 'yaml') { r = Yaml.parse(text); }
     else if (format === 'java') { r = JavaObj.parse(text); }
+    else if (format === 'sql') { r = DFI.Sql.parse(text, { dialect: o && o.dialect }); }
     else { return { ok: false, format: format, error: { message: 'Unknown format: ' + format, line: 0, column: 0, offset: -1 } }; }
     return r.ok ? { ok: true, format: format, parsed: r } : { ok: false, format: format, error: r.error };
   };
@@ -2186,6 +2540,7 @@
     if (format === 'json') { a = Json.analyze(parsed); }
     else if (format === 'xml') { a = Xml.analyze(parsed); }
     else if (format === 'yaml') { a = Yaml.analyze(parsed); }
+    else if (format === 'sql') { a = DFI.Sql.analyze(parsed); }
     else { a = JavaObj.analyze(parsed); }
     a.notes = a.notes || [];
     return a;
@@ -2552,6 +2907,9 @@
         if (from === 'json') { res = { ok: true, text: minify ? Json.minify(p) : Json.beautify(p, unit), notices: [] }; }
         else if (from === 'xml') { res = minify ? Xml.minify(p) : Xml.beautify(p, unit); }
         else if (from === 'yaml') { res = minify ? Yaml.minify(p) : Yaml.beautify(p, unit); if (res.ok) { res.notices = res.notices.concat(yamlOrderNotice(p)); } }
+        else if (from === 'sql') {
+          res = minify ? DFI.Sql.minify(p) : DFI.Sql.beautify(p, { dialect: o.sql && o.sql.dialect, indent: o.indent, keywordCase: o.sql && o.sql.keywordCase });
+        }
         else { res = minify ? JavaObj.minify(p) : JavaObj.beautify(p, unit); }
       } else if (key === 'json>yaml') {
         v = jsonTreeToValue(p);
@@ -2691,6 +3049,24 @@
     {
       id: 'yaml-bad', format: 'yaml', label: 'YAML: invalid (inconsistent indentation)',
       text: 'service:\n  name: api\n  port: 8080\n debug: true'
+    },
+    {
+      id: 'sql-report', format: 'sql', label: 'SQL: report with CTE, joins and NULL checks',
+      // Expected: statements 1, comments 1, nulls 2 (IS NOT NULL is a test, not counted), empty strings 1, warning for "= NULL"
+      text: "-- Daily settlement report\nWITH settled AS (select t.id, t.amount, t.currency, m.name as merchant from transactions t join merchants m on m.id=t.merchant_id where t.status='SETTLED' and t.settled_at >= '2026-10-01' and t.note <> ''), totals as (select merchant, sum(amount) total, count(*) cnt from settled group by merchant having sum(amount) > 100) select s.merchant, s.total, coalesce(r.rate, NULL) as rate from totals s left join rates r on r.currency = 'USD' where r.rate IS NOT NULL or s.total = NULL order by s.total desc limit 10;"
+    },
+    {
+      id: 'sql-dml', format: 'sql', label: 'SQL: INSERT, UPDATE and DELETE (no WHERE warning)',
+      // Expected: statements 3, nulls 2, empty strings 1, warnings: UPDATE and DELETE have no WHERE
+      text: "INSERT INTO accounts (id, name, email, note) VALUES (1, 'Sok', NULL, ''), (2, 'O''Brien', 'x@y.kh', 'null');\nUPDATE accounts SET balance = balance - 5.50, email = NULL;\nDELETE FROM audit_log;"
+    },
+    {
+      id: 'sql-postgres', format: 'sql', dialect: 'postgresql', label: 'SQL: PostgreSQL function with $$ body',
+      text: "create or replace function add_tax(amount numeric) returns numeric as $$ begin return amount * 1.1; end; $$ language plpgsql; select data->>'name' as n, items[1], total::int from orders where payload @> '{\"paid\": true}'::jsonb;"
+    },
+    {
+      id: 'sql-bad', format: 'sql', label: 'SQL: invalid (unterminated string)',
+      text: "SELECT id, name FROM users\nWHERE name = 'Sok AND active = 1;"
     },
     {
       id: 'java-user', format: 'java', label: 'Java: User{...} with a null',
@@ -2880,7 +3256,7 @@
      Files
      ------------------------------------------------------------------ */
   var F = DFI.Files = {};
-  F.ACCEPT = ['.json', '.xml', '.yaml', '.yml', '.txt', '.java'];
+  F.ACCEPT = ['.json', '.xml', '.yaml', '.yml', '.txt', '.java', '.sql'];
   F.MAX_BYTES = 20 * 1024 * 1024;
 
   function extOf(name) {
@@ -2894,22 +3270,23 @@
     if (e === '.xml') { return 'xml'; }
     if (e === '.yaml' || e === '.yml') { return 'yaml'; }
     if (e === '.java') { return 'java'; }
+    if (e === '.sql') { return 'sql'; }
     return null;                                   // .txt: detect from the content
   };
 
   // Java-style output is plain text, not Java source, so it is saved as .txt.
   F.extensionFor = function (format) {
-    return { json: '.json', xml: '.xml', yaml: '.yaml', java: '.txt' }[format] || '.txt';
+    return { json: '.json', xml: '.xml', yaml: '.yaml', java: '.txt', sql: '.sql' }[format] || '.txt';
   };
   F.mimeFor = function (format) {
-    return { json: 'application/json', xml: 'application/xml', yaml: 'application/x-yaml', java: 'text/plain' }[format] || 'text/plain';
+    return { json: 'application/json', xml: 'application/xml', yaml: 'application/x-yaml', java: 'text/plain', sql: 'application/sql' }[format] || 'text/plain';
   };
   F.fileName = function (side, format) { return side + F.extensionFor(format); };
 
   F.validate = function (file) {
     var e = extOf(file.name);
     if (F.ACCEPT.indexOf(e) < 0) {
-      return { ok: false, message: 'Unsupported file type "' + (e || 'no extension') + '". Use .json, .xml, .yaml, .yml, .txt or .java.' };
+      return { ok: false, message: 'Unsupported file type "' + (e || 'no extension') + '". Use .json, .xml, .yaml, .yml, .sql, .txt or .java.' };
     }
     if (!file.size) { return { ok: false, message: 'The file "' + file.name + '" is empty.' }; }
     if (file.size > F.MAX_BYTES) {
@@ -3083,7 +3460,8 @@
     };
   });
 
-  function modeFor(format) {
+  function modeFor(format, dialect) {
+    if (format === 'sql') { return DFI.Sql.mimeFor(dialect); }
     if (format === 'json') { return { name: 'javascript', json: true }; }
     if (format === 'xml') { return 'application/xml'; }
     if (format === 'yaml') { return 'yaml'; }
@@ -3091,7 +3469,8 @@
     return null;
   }
 
-  var DEFAULT_SETTINGS = { indent: '2', wrap: false, lineNumbers: true, mode: 'auto' };
+  var DEFAULT_SETTINGS = { indent: '2', wrap: false, lineNumbers: true, mode: 'auto', sqlDialect: 'sql', sqlCase: 'upper' };
+  var SQL_AUTO_MAX_CHARS = 100000;      // the SQL formatter library needs about 5 ms per KB, so Auto mode stops earlier for SQL
   var TYPE_WORDS = { 'null': 'null values', emptyString: 'empty strings', emptyArray: 'empty arrays', emptyObject: 'empty objects', emptyElement: 'empty elements' };
 
   /* ------------------------------------------------------------------
@@ -3212,7 +3591,7 @@
     var ctx = { $scope: $scope, $timeout: $timeout, cm: {}, hooks: {} };
     var cache = { input: null, output: null, mixed: null };
     var silent = { input: false, output: false };
-    var state = { inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', mixedActive: false, modes: { input: undefined, output: undefined } };
+    var state = { sqlDialect: null, inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', mixedActive: false, modes: { input: undefined, output: undefined } };
 
     /* ---------- small helpers ---------- */
     ctx.apply = function (fn) { $scope.$evalAsync(fn); };
@@ -3251,6 +3630,10 @@
     vm.settings = angular.extend({}, DEFAULT_SETTINGS, Store.get('settings', {}));
     if (['2', '4', 'tab'].indexOf(vm.settings.indent) < 0) { vm.settings.indent = '2'; }
     if (vm.settings.mode !== 'auto' && vm.settings.mode !== 'manual') { vm.settings.mode = 'auto'; }
+    if (!DFI.Sql.DIALECTS.some(function (d) { return d.id === vm.settings.sqlDialect; })) { vm.settings.sqlDialect = 'sql'; }
+    if (!DFI.Sql.CASES.some(function (d) { return d.id === vm.settings.sqlCase; })) { vm.settings.sqlCase = 'upper'; }
+    vm.sqlDialects = DFI.Sql.DIALECTS;
+    vm.sqlCases = DFI.Sql.CASES;
     vm.showSettings = false;
     vm.sampleMenuOpen = false;
     vm.showDetails = false;
@@ -3298,7 +3681,7 @@
         spellcheck: false, autocorrect: false, autocapitalize: false
       };
     }
-    ctx.cm.input = CM(global.document.getElementById('inputEditor'), editorOptions('Paste or type JSON, XML, YAML or a Java-style object here, or drop a file'));
+    ctx.cm.input = CM(global.document.getElementById('inputEditor'), editorOptions('Paste or type JSON, XML, YAML, SQL or a Java-style object here, or drop a file'));
     ctx.cm.output = CM(global.document.getElementById('outputEditor'), editorOptions('The formatted output appears here'));
 
     function applyEditorOptions() {
@@ -3319,8 +3702,8 @@
     $timeout(refreshEditors, 0);
 
     function applyModes(inFmt, outFmt) {
-      if (state.modes.input !== inFmt) { state.modes.input = inFmt; ctx.cm.input.setOption('mode', modeFor(inFmt)); }
-      if (state.modes.output !== outFmt) { state.modes.output = outFmt; ctx.cm.output.setOption('mode', modeFor(outFmt)); }
+      if (state.modes.input !== inFmt) { state.modes.input = inFmt; ctx.cm.input.setOption('mode', modeFor(inFmt, vm.settings.sqlDialect)); }
+      if (state.modes.output !== outFmt) { state.modes.output = outFmt; ctx.cm.output.setOption('mode', modeFor(outFmt, vm.settings.sqlDialect)); }
     }
 
     function refreshStats(side) { vm.stats[side] = Util.textStats(ctx.cm[side].getValue()); }
@@ -3341,7 +3724,7 @@
     ctx.setOutputFormat = function (fmt) {
       vm.outputFormat = fmt; state.outFmt = fmt;
       state.modes.output = fmt;
-      ctx.cm.output.setOption('mode', modeFor(fmt));
+      ctx.cm.output.setOption('mode', modeFor(fmt, vm.settings.sqlDialect));
       updateLabels();
     };
 
@@ -3375,11 +3758,11 @@
 
     /* ---------- parsing with a one-entry cache per side ---------- */
     function parseCached(side, fmt, text) {
-      var c = cache[side], res;
-      if (c && c.fmt === fmt && c.text === text) { return c.res; }
-      try { res = Convert.parse(fmt, text); }
+      var c = cache[side], res, dialect = vm.settings.sqlDialect;
+      if (c && c.fmt === fmt && c.text === text && (fmt !== 'sql' || c.dialect === dialect)) { return c.res; }
+      try { res = Convert.parse(fmt, text, { dialect: dialect }); }
       catch (e) { res = { ok: false, format: fmt, error: { message: friendly(e), line: 0, column: 0, offset: -1 } }; }
-      cache[side] = { fmt: fmt, text: text, res: res };
+      cache[side] = { fmt: fmt, text: text, res: res, dialect: dialect };
       return res;
     }
     function analysisOf(res) {
@@ -3414,7 +3797,9 @@
       vm.validation = {
         status: 'valid', error: null, warnings: w,
         label: res.parsed.fragment ? 'Valid fragment' : 'Valid',
-        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.' : 'The input is valid ' + Convert.label(fmt) + '.'
+        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.'
+          : (fmt === 'sql' ? 'No unterminated strings, names or comments, and the parentheses balance. This is a text check only: the tool cannot check table names, types or the full grammar without your database.'
+            : 'The input is valid ' + Convert.label(fmt) + '.')
       };
     }
     function clearErrorMark() {
@@ -3454,7 +3839,9 @@
         { key: 'emptyObjects', label: 'Empty objects', value: v('emptyObjects'), filter: 'emptyObject', cls: 'c-emptyobject', hint: 'Click to list' },
         { key: 'emptyElements', label: 'Empty XML elements', value: v('emptyElements'), filter: 'emptyElement', cls: 'c-emptyelement', hint: 'No content, or only whitespace. Click to list.' },
         { key: 'whitespaceTexts', label: 'Whitespace-only text', value: v('whitespaceTexts'), filter: null, cls: 'c-neutral', hint: 'XML elements whose only content is whitespace' },
-        { key: 'duplicateKeys', label: 'Duplicate keys', value: v('duplicateKeys'), filter: null, cls: 'c-neutral', hint: 'Repeated keys inside one object' }
+        { key: 'duplicateKeys', label: 'Duplicate keys', value: v('duplicateKeys'), filter: null, cls: 'c-neutral', hint: 'Repeated keys inside one object' },
+        { key: 'statements', label: 'SQL statements', value: v('statements'), filter: null, cls: 'c-neutral', hint: 'Statements separated by ; (approximate for procedures)' },
+        { key: 'comments', label: 'SQL comments', value: v('comments'), filter: null, cls: 'c-neutral', hint: 'Line and block comments' }
       ];
       function n(key) { return typeof c[key] === 'number' ? c[key] : 0; }
       vm.inspectFilters = [
@@ -3617,7 +4004,7 @@
       state.mixedActive = false;
       clearErrorMark();
 
-      if (action === 'auto' && text.length > Util.LIMITS.autoMaxChars) {
+      if (action === 'auto' && text.length > (effectiveInput(text) === 'sql' ? SQL_AUTO_MAX_CHARS : Util.LIMITS.autoMaxChars)) {
         setIdle('Auto mode is paused for large input (' + (text.length / 1048576).toFixed(1) + ' MB of text). Click Validate or Beautify, or switch to Manual mode.');
         vm.dirty = true; showNoAnalysis('input', 'Auto mode is paused for large input.');
         return;
@@ -3662,7 +4049,7 @@
           vm.conversionNotices = [{ level: 'info', text: 'The output was not refreshed because you edited it. Click Beautify or Minify to replace it.' }];
         } else {
           mode = action === 'auto' ? vm.lastAction : action;
-          out = Convert.run({ parsed: res.parsed, from: inFmt, to: outFmt, mode: mode, indent: vm.settings.indent });
+          out = Convert.run({ parsed: res.parsed, from: inFmt, to: outFmt, mode: mode, indent: vm.settings.indent, sql: { dialect: vm.settings.sqlDialect, keywordCase: vm.settings.sqlCase } });
           if (out.ok) {
             ctx.setText('output', out.text);
             notices = out.notices || [];
@@ -3770,6 +4157,7 @@
 
     vm.loadSample = function (s) {
       vm.sampleMenuOpen = false;
+      if (s.dialect) { vm.settings.sqlDialect = s.dialect; state.sqlDialect = s.dialect; Store.set('settings', vm.settings); }
       vm.inputFormat = s.format;
       vm.outputFormat = 'same';
       state.modes.input = undefined; state.modes.output = undefined;
@@ -3799,8 +4187,18 @@
       if (vm.showSettings || vm.sampleMenuOpen) { ctx.apply(function () { vm.showSettings = false; vm.sampleMenuOpen = false; }); }
     });
     vm.onSettingsChange = function () {
+      var dialectChanged = vm.settings.sqlDialect !== state.sqlDialect;
+      state.sqlDialect = vm.settings.sqlDialect;
       Store.set('settings', vm.settings);
       applyEditorOptions();
+      if (dialectChanged) {
+        state.modes.input = undefined; state.modes.output = undefined;
+        if (state.inFmt === 'sql' || vm.inputFormat === 'sql') {          // the dialect changes how SQL is read, so check it again
+          ctx.schedule(vm.settings.mode === 'auto' ? 'auto' : 'validate', 'settings');
+          if (vm.settings.mode === 'manual') { vm.dirty = true; }
+          return;
+        }
+      }
       if (ctx.cm.output.getValue() && !vm.outputEdited && ctx.cm.input.getValue().trim()) {
         if (vm.settings.mode === 'auto') { ctx.schedule(vm.lastAction, 'settings'); } else { vm.dirty = true; }
       }
@@ -4052,7 +4450,7 @@
       m = /^<[^>]*>/.exec(rest)                                                    // XML start tag
         || /^(?:[A-Za-z_$][\w.$]*)?[\[{(]\s*[\]})]/.exec(rest)                      // [] {} Name{} Name()
         || /^(?:""|'')/.exec(rest)                                                  // empty quoted string
-        || /^(?:null|~)(?![\w])/.exec(rest);                                        // null
+        || /^(?:null|~)(?![\w])/i.exec(rest);                                       // null
       return { line: from.line, ch: from.ch + (m ? m[0].length : Math.min(1, Math.max(rest.length, 1))) };
     }
 

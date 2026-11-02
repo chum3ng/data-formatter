@@ -61,7 +61,8 @@
     };
   });
 
-  function modeFor(format) {
+  function modeFor(format, dialect) {
+    if (format === 'sql') { return DFI.Sql.mimeFor(dialect); }
     if (format === 'json') { return { name: 'javascript', json: true }; }
     if (format === 'xml') { return 'application/xml'; }
     if (format === 'yaml') { return 'yaml'; }
@@ -69,7 +70,8 @@
     return null;
   }
 
-  var DEFAULT_SETTINGS = { indent: '2', wrap: false, lineNumbers: true, mode: 'auto' };
+  var DEFAULT_SETTINGS = { indent: '2', wrap: false, lineNumbers: true, mode: 'auto', sqlDialect: 'sql', sqlCase: 'upper' };
+  var SQL_AUTO_MAX_CHARS = 100000;      // the SQL formatter library needs about 5 ms per KB, so Auto mode stops earlier for SQL
   var TYPE_WORDS = { 'null': 'null values', emptyString: 'empty strings', emptyArray: 'empty arrays', emptyObject: 'empty objects', emptyElement: 'empty elements' };
 
   /* ------------------------------------------------------------------
@@ -190,7 +192,7 @@
     var ctx = { $scope: $scope, $timeout: $timeout, cm: {}, hooks: {} };
     var cache = { input: null, output: null, mixed: null };
     var silent = { input: false, output: false };
-    var state = { inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', mixedActive: false, modes: { input: undefined, output: undefined } };
+    var state = { sqlDialect: null, inFmt: null, outFmt: null, outGen: 0, errHandle: null, toastTimer: null, allItems: [], noAnalysis: '', mixedActive: false, modes: { input: undefined, output: undefined } };
 
     /* ---------- small helpers ---------- */
     ctx.apply = function (fn) { $scope.$evalAsync(fn); };
@@ -229,6 +231,10 @@
     vm.settings = angular.extend({}, DEFAULT_SETTINGS, Store.get('settings', {}));
     if (['2', '4', 'tab'].indexOf(vm.settings.indent) < 0) { vm.settings.indent = '2'; }
     if (vm.settings.mode !== 'auto' && vm.settings.mode !== 'manual') { vm.settings.mode = 'auto'; }
+    if (!DFI.Sql.DIALECTS.some(function (d) { return d.id === vm.settings.sqlDialect; })) { vm.settings.sqlDialect = 'sql'; }
+    if (!DFI.Sql.CASES.some(function (d) { return d.id === vm.settings.sqlCase; })) { vm.settings.sqlCase = 'upper'; }
+    vm.sqlDialects = DFI.Sql.DIALECTS;
+    vm.sqlCases = DFI.Sql.CASES;
     vm.showSettings = false;
     vm.sampleMenuOpen = false;
     vm.showDetails = false;
@@ -276,7 +282,7 @@
         spellcheck: false, autocorrect: false, autocapitalize: false
       };
     }
-    ctx.cm.input = CM(global.document.getElementById('inputEditor'), editorOptions('Paste or type JSON, XML, YAML or a Java-style object here, or drop a file'));
+    ctx.cm.input = CM(global.document.getElementById('inputEditor'), editorOptions('Paste or type JSON, XML, YAML, SQL or a Java-style object here, or drop a file'));
     ctx.cm.output = CM(global.document.getElementById('outputEditor'), editorOptions('The formatted output appears here'));
 
     function applyEditorOptions() {
@@ -297,8 +303,8 @@
     $timeout(refreshEditors, 0);
 
     function applyModes(inFmt, outFmt) {
-      if (state.modes.input !== inFmt) { state.modes.input = inFmt; ctx.cm.input.setOption('mode', modeFor(inFmt)); }
-      if (state.modes.output !== outFmt) { state.modes.output = outFmt; ctx.cm.output.setOption('mode', modeFor(outFmt)); }
+      if (state.modes.input !== inFmt) { state.modes.input = inFmt; ctx.cm.input.setOption('mode', modeFor(inFmt, vm.settings.sqlDialect)); }
+      if (state.modes.output !== outFmt) { state.modes.output = outFmt; ctx.cm.output.setOption('mode', modeFor(outFmt, vm.settings.sqlDialect)); }
     }
 
     function refreshStats(side) { vm.stats[side] = Util.textStats(ctx.cm[side].getValue()); }
@@ -319,7 +325,7 @@
     ctx.setOutputFormat = function (fmt) {
       vm.outputFormat = fmt; state.outFmt = fmt;
       state.modes.output = fmt;
-      ctx.cm.output.setOption('mode', modeFor(fmt));
+      ctx.cm.output.setOption('mode', modeFor(fmt, vm.settings.sqlDialect));
       updateLabels();
     };
 
@@ -353,11 +359,11 @@
 
     /* ---------- parsing with a one-entry cache per side ---------- */
     function parseCached(side, fmt, text) {
-      var c = cache[side], res;
-      if (c && c.fmt === fmt && c.text === text) { return c.res; }
-      try { res = Convert.parse(fmt, text); }
+      var c = cache[side], res, dialect = vm.settings.sqlDialect;
+      if (c && c.fmt === fmt && c.text === text && (fmt !== 'sql' || c.dialect === dialect)) { return c.res; }
+      try { res = Convert.parse(fmt, text, { dialect: dialect }); }
       catch (e) { res = { ok: false, format: fmt, error: { message: friendly(e), line: 0, column: 0, offset: -1 } }; }
-      cache[side] = { fmt: fmt, text: text, res: res };
+      cache[side] = { fmt: fmt, text: text, res: res, dialect: dialect };
       return res;
     }
     function analysisOf(res) {
@@ -392,7 +398,9 @@
       vm.validation = {
         status: 'valid', error: null, warnings: w,
         label: res.parsed.fragment ? 'Valid fragment' : 'Valid',
-        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.' : 'The input is valid ' + Convert.label(fmt) + '.'
+        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.'
+          : (fmt === 'sql' ? 'No unterminated strings, names or comments, and the parentheses balance. This is a text check only: the tool cannot check table names, types or the full grammar without your database.'
+            : 'The input is valid ' + Convert.label(fmt) + '.')
       };
     }
     function clearErrorMark() {
@@ -432,7 +440,9 @@
         { key: 'emptyObjects', label: 'Empty objects', value: v('emptyObjects'), filter: 'emptyObject', cls: 'c-emptyobject', hint: 'Click to list' },
         { key: 'emptyElements', label: 'Empty XML elements', value: v('emptyElements'), filter: 'emptyElement', cls: 'c-emptyelement', hint: 'No content, or only whitespace. Click to list.' },
         { key: 'whitespaceTexts', label: 'Whitespace-only text', value: v('whitespaceTexts'), filter: null, cls: 'c-neutral', hint: 'XML elements whose only content is whitespace' },
-        { key: 'duplicateKeys', label: 'Duplicate keys', value: v('duplicateKeys'), filter: null, cls: 'c-neutral', hint: 'Repeated keys inside one object' }
+        { key: 'duplicateKeys', label: 'Duplicate keys', value: v('duplicateKeys'), filter: null, cls: 'c-neutral', hint: 'Repeated keys inside one object' },
+        { key: 'statements', label: 'SQL statements', value: v('statements'), filter: null, cls: 'c-neutral', hint: 'Statements separated by ; (approximate for procedures)' },
+        { key: 'comments', label: 'SQL comments', value: v('comments'), filter: null, cls: 'c-neutral', hint: 'Line and block comments' }
       ];
       function n(key) { return typeof c[key] === 'number' ? c[key] : 0; }
       vm.inspectFilters = [
@@ -595,7 +605,7 @@
       state.mixedActive = false;
       clearErrorMark();
 
-      if (action === 'auto' && text.length > Util.LIMITS.autoMaxChars) {
+      if (action === 'auto' && text.length > (effectiveInput(text) === 'sql' ? SQL_AUTO_MAX_CHARS : Util.LIMITS.autoMaxChars)) {
         setIdle('Auto mode is paused for large input (' + (text.length / 1048576).toFixed(1) + ' MB of text). Click Validate or Beautify, or switch to Manual mode.');
         vm.dirty = true; showNoAnalysis('input', 'Auto mode is paused for large input.');
         return;
@@ -640,7 +650,7 @@
           vm.conversionNotices = [{ level: 'info', text: 'The output was not refreshed because you edited it. Click Beautify or Minify to replace it.' }];
         } else {
           mode = action === 'auto' ? vm.lastAction : action;
-          out = Convert.run({ parsed: res.parsed, from: inFmt, to: outFmt, mode: mode, indent: vm.settings.indent });
+          out = Convert.run({ parsed: res.parsed, from: inFmt, to: outFmt, mode: mode, indent: vm.settings.indent, sql: { dialect: vm.settings.sqlDialect, keywordCase: vm.settings.sqlCase } });
           if (out.ok) {
             ctx.setText('output', out.text);
             notices = out.notices || [];
@@ -748,6 +758,7 @@
 
     vm.loadSample = function (s) {
       vm.sampleMenuOpen = false;
+      if (s.dialect) { vm.settings.sqlDialect = s.dialect; state.sqlDialect = s.dialect; Store.set('settings', vm.settings); }
       vm.inputFormat = s.format;
       vm.outputFormat = 'same';
       state.modes.input = undefined; state.modes.output = undefined;
@@ -777,8 +788,18 @@
       if (vm.showSettings || vm.sampleMenuOpen) { ctx.apply(function () { vm.showSettings = false; vm.sampleMenuOpen = false; }); }
     });
     vm.onSettingsChange = function () {
+      var dialectChanged = vm.settings.sqlDialect !== state.sqlDialect;
+      state.sqlDialect = vm.settings.sqlDialect;
       Store.set('settings', vm.settings);
       applyEditorOptions();
+      if (dialectChanged) {
+        state.modes.input = undefined; state.modes.output = undefined;
+        if (state.inFmt === 'sql' || vm.inputFormat === 'sql') {          // the dialect changes how SQL is read, so check it again
+          ctx.schedule(vm.settings.mode === 'auto' ? 'auto' : 'validate', 'settings');
+          if (vm.settings.mode === 'manual') { vm.dirty = true; }
+          return;
+        }
+      }
       if (ctx.cm.output.getValue() && !vm.outputEdited && ctx.cm.input.getValue().trim()) {
         if (vm.settings.mode === 'auto') { ctx.schedule(vm.lastAction, 'settings'); } else { vm.dirty = true; }
       }

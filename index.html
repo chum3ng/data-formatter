@@ -67,6 +67,14 @@
         </label>
         <label class="check"><input type="checkbox" ng-model="vm.settings.wrap" ng-change="vm.onSettingsChange()"> Wrap long lines</label>
         <label class="check"><input type="checkbox" ng-model="vm.settings.lineNumbers" ng-change="vm.onSettingsChange()"> Show line numbers</label>
+        <label class="field">
+          <span>SQL dialect</span>
+          <select class="select" ng-model="vm.settings.sqlDialect" ng-options="d.id as d.label for d in vm.sqlDialects" ng-change="vm.onSettingsChange()"></select>
+        </label>
+        <label class="field">
+          <span>SQL keyword case</span>
+          <select class="select" ng-model="vm.settings.sqlCase" ng-options="d.id as d.label for d in vm.sqlCases" ng-change="vm.onSettingsChange()"></select>
+        </label>
         <p class="hint">Indentation applies to Beautify and to conversions. Values are never reordered or changed.</p>
       </div>
     </div>
@@ -130,7 +138,7 @@
             <li ng-repeat="s in vm.samples track by s.id"><button type="button" class="menu-item" ng-click="vm.loadSample(s)">{{ s.label }}</button></li>
           </ul>
         </div>
-        <button type="button" class="btn btn--small" ng-click="vm.triggerUpload('input')" title="Upload a file (.json .xml .yaml .yml .txt .java)">
+        <button type="button" class="btn btn--small" ng-click="vm.triggerUpload('input')" title="Upload a file (.json .xml .yaml .yml .sql .txt .java)">
           <svg class="ic"><use href="#i-upload"/></svg><span class="btn-label">Upload</span>
         </button>
         <button type="button" class="btn btn--small" ng-click="vm.pasteFromClipboard()" title="Paste from clipboard">
@@ -163,7 +171,7 @@
       <div id="inputEditor" class="editor"></div>
       <div class="drop-overlay">Drop a text file to load it here</div>
     </div>
-    <input type="file" id="fileInputInput" class="sr-only" tabindex="-1" accept=".json,.xml,.yaml,.yml,.txt,.java" dfi-file-input="vm.handleFiles(files, 'input')">
+    <input type="file" id="fileInputInput" class="sr-only" tabindex="-1" accept=".json,.xml,.yaml,.yml,.sql,.txt,.java" dfi-file-input="vm.handleFiles(files, 'input')">
   </section>
 
   <div class="resizer" id="panelResizer" dfi-resizer role="separator" aria-orientation="vertical" tabindex="0" title="Drag to resize the panels"></div>
@@ -242,7 +250,7 @@
       <div id="outputEditor" class="editor"></div>
       <div class="drop-overlay">Drop a text file to load it here</div>
     </div>
-    <input type="file" id="fileInputOutput" class="sr-only" tabindex="-1" accept=".json,.xml,.yaml,.yml,.txt,.java" dfi-file-input="vm.handleFiles(files, 'output')">
+    <input type="file" id="fileInputOutput" class="sr-only" tabindex="-1" accept=".json,.xml,.yaml,.yml,.sql,.txt,.java" dfi-file-input="vm.handleFiles(files, 'output')">
   </section>
 </main>
 
@@ -343,7 +351,8 @@
         <li><b>XML:</b> there is no native null. An element counts as null only when it has <code>xsi:nil="true"</code>. An empty element has no child nodes or only whitespace, as in <code>&lt;a&gt;&lt;/a&gt;</code> and <code>&lt;a/&gt;</code>. Whitespace-only text nodes are reported separately.</li>
         <li><b>Java-style:</b> null is the bare token <code>null</code>. Empty strings are <code>""</code> or <code>''</code>. Empty collections are <code>[]</code> or <code>{}</code>. Empty objects are <code>Name{}</code> or <code>Name()</code>.</li>
         <li>Statistics that do not apply to a format show N/A. A count of 0 means there were none.</li>
-        <li>Paths look like <code>$.users[0].name</code> (JSON, YAML, Java-style) and <code>/root/customer/name</code> (XML).</li>
+        <li><b>SQL:</b> null counts the NULL keyword used as a value (IS NULL, IS NOT NULL and NOT NULL are not counted). Empty strings are <code>''</code>. Statements, comments and warnings (<code>= NULL</code>, UPDATE or DELETE without WHERE) are listed too.</li>
+        <li>Paths look like <code>$.users[0].name</code> (JSON, YAML, Java-style), <code>/root/customer/name</code> (XML) and <code>statement 2 &middot; WHERE</code> (SQL).</li>
       </ul>
     </div>
     <div class="details-col">
@@ -353,7 +362,8 @@
         <li><b>YAML:</b> js-yaml does not keep comments, and anchor names are regenerated, so the output is rebuilt from the parsed data. Key order is kept, except whole-number keys (such as 10:), which JavaScript lists first.</li>
         <li><b>XML to JSON</b> is lossy for mixed content, namespaces and repeated elements. <b>JSON to XML</b> needs a single root and valid element names.</li>
         <li><b>Java-style</b> support covers common <code>toString()</code> patterns only. Ambiguous or unsupported input is reported, not guessed. Input is never evaluated as code.</li>
-        <li>Large inputs are processed on the main thread with debounce. Above a size threshold, Auto mode pauses and asks you to use Manual mode.</li>
+        <li><b>SQL:</b> checked as text (unterminated strings, names and comments, unbalanced parentheses), not against your database or the full grammar. Formatting uses the dialect you choose in Settings, and a result is discarded if it would change anything but whitespace and keyword case. SQL cannot be converted to other formats.</li>
+        <li>Large inputs are processed on the main thread with debounce. Above a size threshold (about 100,000 characters for SQL), Auto mode pauses and asks you to use Manual mode.</li>
       </ul>
     </div>
     <div class="details-col">
@@ -362,7 +372,8 @@
         <li>AngularJS 1.8.3</li>
         <li>CodeMirror 5.65.16 (javascript, xml, yaml modes; searchcursor and placeholder addons)</li>
         <li>js-yaml 4.1.0</li>
-        <li>All from cdnjs. No data is sent anywhere.</li>
+        <li>sql-formatter 15.9.0 (from jsDelivr), plus the CodeMirror sql mode</li>
+        <li>Loaded from cdnjs and jsDelivr. No data is sent anywhere.</li>
       </ul>
     </div>
   </div>
@@ -381,7 +392,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/yaml/yaml.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/display/placeholder.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sql-formatter@15.9.0/dist/sql-formatter.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

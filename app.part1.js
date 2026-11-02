@@ -41,7 +41,7 @@
       counts: {
         fields: na, objects: na, arrays: na, nulls: na, emptyStrings: na,
         emptyArrays: na, emptyObjects: na, emptyElements: na, duplicateKeys: na,
-        attributes: na, textNodes: na, whitespaceTexts: na
+        attributes: na, textNodes: na, whitespaceTexts: na, statements: na, comments: na
       },
       items: [],        // {type, typeLabel, path, line, column, offset, preview}
       duplicates: [],   // {path, key, line, column, offset}

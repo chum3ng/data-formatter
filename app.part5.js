@@ -26,6 +26,7 @@
 
    Supported conversions (everything else is refused with a clear message, never faked):
      JSON <-> YAML, JSON <-> XML, JSON <-> Java object, and each format to itself (beautify, minify).
+     SQL only formats to SQL (beautify, minify). run() takes {sql:{dialect, keywordCase}} for it.
    Every converted result is parsed again with the target format's engine before it is returned.
 
    JSON -> XML rules: a one-key object becomes the root element, otherwise <root> is added;
@@ -44,7 +45,8 @@
     { id: 'json', label: 'JSON' },
     { id: 'xml', label: 'XML' },
     { id: 'yaml', label: 'YAML' },
-    { id: 'java', label: 'Java object' }
+    { id: 'java', label: 'Java object' },
+    { id: 'sql', label: 'SQL' }
   ];
   C.label = function (id) {
     var i;
@@ -55,7 +57,7 @@
   };
 
   var PATHS = {
-    'json>json': 1, 'xml>xml': 1, 'yaml>yaml': 1, 'java>java': 1,
+    'json>json': 1, 'xml>xml': 1, 'yaml>yaml': 1, 'java>java': 1, 'sql>sql': 1,
     'json>xml': 1, 'json>yaml': 1, 'yaml>json': 1, 'xml>json': 1, 'json>java': 1, 'java>json': 1
   };
   var LOSSY = {
@@ -68,7 +70,7 @@
   C.supports = function (from, to) { return !!PATHS[from + '>' + to]; };
 
   C.unsupportedMessage = function (from, to) {
-    return 'Converting ' + C.label(from) + ' to ' + C.label(to) + ' is not supported. Supported: JSON \u21C4 YAML, JSON \u21C4 XML and JSON \u21C4 Java object. To go between other formats, convert to JSON first.';
+    return 'Converting ' + C.label(from) + ' to ' + C.label(to) + ' is not supported. Supported: JSON \u21C4 YAML, JSON \u21C4 XML and JSON \u21C4 Java object. SQL can only be formatted as SQL. To go between other formats, convert to JSON first.';
   };
 
   C.canSwap = function (from, to) {
@@ -80,8 +82,19 @@
   /* ------------------------------------------------------------------
      Format detection (a quick look at the start of the text, not a full parse)
      ------------------------------------------------------------------ */
+  // How sure we are that the text starts like a SQL statement. Plain English that starts with "update" is not matched.
+  function sqlConfidence(head) {
+    var h = head.replace(/^\s*(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*/, '');
+    if (/^insert\s+(?:or\s+\w+\s+|ignore\s+)?into\s+\S/i.test(h) || /^update\s+(?:only\s+)?[\w."`\[\]]+\s+(?:as\s+\w+\s+)?set\s/i.test(h) ||
+        /^delete\s+from\s+\S/i.test(h) || /^truncate\s+(?:table\s+)?\S/i.test(h) || /^merge\s+into\s+\S/i.test(h) ||
+        /^(?:create|alter|drop)\s+(?:or\s+replace\s+)?(?:(?:global\s+|local\s+)?temp(?:orary)?\s+|unique\s+|materialized\s+|virtual\s+|external\s+)*(?:table|view|index|database|schema|sequence|function|procedure|trigger|type|extension)\b/i.test(h) ||
+        /^with\s+(?:recursive\s+)?[\w"`]+\s*(?:\([^)]*\))?\s+as\s*\(/i.test(h) || /^explain\s+(?:analyze\s+)?select\b/i.test(h) ||
+        /^(?:grant|revoke)\s+[\w ,]+\s+on\s/i.test(h) || /^select\s+[\s\S]*?\bfrom\s+\S/i.test(h)) { return 'high'; }
+    return /^select\s+[\w*'"`(]/i.test(h) ? 'low' : null;
+  }
+
   C.detect = function (text) {
-    var s = text.replace(/^\uFEFF/, '').trim(), head, c;
+    var s = text.replace(/^\uFEFF/, '').trim(), head, c, sc;
     if (!s) { return { format: 'unknown', confidence: 'low', reason: 'empty' }; }
     head = s.slice(0, 4000);
     c = s.charAt(0);
@@ -99,6 +112,8 @@
       if (/^\[\s*(?:["{\[\-\d]|true\b|false\b|null\b|\])/.test(head)) { return { format: 'json', confidence: 'high', reason: 'array' }; }
       return { format: 'yaml', confidence: 'low', reason: 'flow sequence' };
     }
+    sc = sqlConfidence(head);
+    if (sc) { return { format: 'sql', confidence: sc, reason: 'starts like a SQL statement' }; }
     if (/^[A-Za-z_][\w.]*[{(\[]/.test(head)) { return { format: 'java', confidence: 'high', reason: 'Name{...} object' }; }
     if (/^---/.test(head) || /^[ \t]*[\w"'.\-][^\n:]*:(?:[ \t]|$)/m.test(head) || /^[ \t]*-[ \t]+\S/m.test(head)) {
       return { format: 'yaml', confidence: 'high', reason: 'key: value or list lines' };
@@ -118,7 +133,7 @@
   /* ------------------------------------------------------------------
      parse / analyze dispatch
      ------------------------------------------------------------------ */
-  C.parse = function (format, text) {
+  C.parse = function (format, text, o) {
     var r;
     if (format === 'json') { r = Json.parse(text); }
     else if (format === 'xml') {
@@ -129,6 +144,7 @@
     }
     else if (format === 'yaml') { r = Yaml.parse(text); }
     else if (format === 'java') { r = JavaObj.parse(text); }
+    else if (format === 'sql') { r = DFI.Sql.parse(text, { dialect: o && o.dialect }); }
     else { return { ok: false, format: format, error: { message: 'Unknown format: ' + format, line: 0, column: 0, offset: -1 } }; }
     return r.ok ? { ok: true, format: format, parsed: r } : { ok: false, format: format, error: r.error };
   };
@@ -138,6 +154,7 @@
     if (format === 'json') { a = Json.analyze(parsed); }
     else if (format === 'xml') { a = Xml.analyze(parsed); }
     else if (format === 'yaml') { a = Yaml.analyze(parsed); }
+    else if (format === 'sql') { a = DFI.Sql.analyze(parsed); }
     else { a = JavaObj.analyze(parsed); }
     a.notes = a.notes || [];
     return a;
@@ -504,6 +521,9 @@
         if (from === 'json') { res = { ok: true, text: minify ? Json.minify(p) : Json.beautify(p, unit), notices: [] }; }
         else if (from === 'xml') { res = minify ? Xml.minify(p) : Xml.beautify(p, unit); }
         else if (from === 'yaml') { res = minify ? Yaml.minify(p) : Yaml.beautify(p, unit); if (res.ok) { res.notices = res.notices.concat(yamlOrderNotice(p)); } }
+        else if (from === 'sql') {
+          res = minify ? DFI.Sql.minify(p) : DFI.Sql.beautify(p, { dialect: o.sql && o.sql.dialect, indent: o.indent, keywordCase: o.sql && o.sql.keywordCase });
+        }
         else { res = minify ? JavaObj.minify(p) : JavaObj.beautify(p, unit); }
       } else if (key === 'json>yaml') {
         v = jsonTreeToValue(p);
@@ -643,6 +663,24 @@
     {
       id: 'yaml-bad', format: 'yaml', label: 'YAML: invalid (inconsistent indentation)',
       text: 'service:\n  name: api\n  port: 8080\n debug: true'
+    },
+    {
+      id: 'sql-report', format: 'sql', label: 'SQL: report with CTE, joins and NULL checks',
+      // Expected: statements 1, comments 1, nulls 2 (IS NOT NULL is a test, not counted), empty strings 1, warning for "= NULL"
+      text: "-- Daily settlement report\nWITH settled AS (select t.id, t.amount, t.currency, m.name as merchant from transactions t join merchants m on m.id=t.merchant_id where t.status='SETTLED' and t.settled_at >= '2026-10-01' and t.note <> ''), totals as (select merchant, sum(amount) total, count(*) cnt from settled group by merchant having sum(amount) > 100) select s.merchant, s.total, coalesce(r.rate, NULL) as rate from totals s left join rates r on r.currency = 'USD' where r.rate IS NOT NULL or s.total = NULL order by s.total desc limit 10;"
+    },
+    {
+      id: 'sql-dml', format: 'sql', label: 'SQL: INSERT, UPDATE and DELETE (no WHERE warning)',
+      // Expected: statements 3, nulls 2, empty strings 1, warnings: UPDATE and DELETE have no WHERE
+      text: "INSERT INTO accounts (id, name, email, note) VALUES (1, 'Sok', NULL, ''), (2, 'O''Brien', 'x@y.kh', 'null');\nUPDATE accounts SET balance = balance - 5.50, email = NULL;\nDELETE FROM audit_log;"
+    },
+    {
+      id: 'sql-postgres', format: 'sql', dialect: 'postgresql', label: 'SQL: PostgreSQL function with $$ body',
+      text: "create or replace function add_tax(amount numeric) returns numeric as $$ begin return amount * 1.1; end; $$ language plpgsql; select data->>'name' as n, items[1], total::int from orders where payload @> '{\"paid\": true}'::jsonb;"
+    },
+    {
+      id: 'sql-bad', format: 'sql', label: 'SQL: invalid (unterminated string)',
+      text: "SELECT id, name FROM users\nWHERE name = 'Sok AND active = 1;"
     },
     {
       id: 'java-user', format: 'java', label: 'Java: User{...} with a null',
