@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Data Formatter &amp; Inspector</title>
+<link rel="icon" href="data:,">
 <!-- External CSS (pinned) -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="styles.css">
@@ -396,5 +397,33 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sql-formatter@15.9.0/dist/sql-formatter.min.js"></script>
 <script src="app.js"></script>
+<script>
+/* Startup check: if a file or library failed to load (for example a 404), say exactly which one. */
+window.addEventListener('load', function () {
+  var w = window, cm = w.CodeMirror, modes = (cm && cm.modes) || {}, header = w.document.querySelector('.app-header'), missing = [], box, close, list;
+  if (!(w.DFI && w.DFI.Util)) { missing.push('app.js (it must be in the same folder as index.html)'); }
+  if (!w.angular) { missing.push('AngularJS 1.8.3 (cdnjs)'); }
+  if (!cm) { missing.push('CodeMirror 5.65.16 (cdnjs)'); }
+  else if (!(modes.javascript && modes.xml && modes.yaml && modes.sql)) { missing.push('a CodeMirror syntax mode: javascript, xml, yaml or sql (cdnjs)'); }
+  if (!w.jsyaml) { missing.push('js-yaml 4.1.0 (cdnjs). YAML will not work.'); }
+  if (!w.sqlFormatter) { missing.push('sql-formatter 15.9.0 (jsDelivr). SQL formatting will not work.'); }
+  if (header && w.getComputedStyle(header).display !== 'flex') { missing.push('styles.css (it must be in the same folder as index.html)'); }
+  if (!missing.length) { return; }
+  box = w.document.createElement('div');
+  box.setAttribute('role', 'alert');
+  box.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:1000;padding:10px 14px;background:#7a1f1f;color:#fff;font:13px/1.45 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.4)';
+  box.appendChild(w.document.createTextNode('Some files did not load, so parts of this page may not work. Open the browser DevTools (F12), choose Network, and look for the red 404 rows. Missing:'));
+  list = w.document.createElement('ul');
+  list.style.margin = '6px 0 0 18px';
+  missing.forEach(function (m) { var li = w.document.createElement('li'); li.textContent = m; list.appendChild(li); });
+  box.appendChild(list);
+  close = w.document.createElement('button');
+  close.textContent = 'Dismiss';
+  close.style.cssText = 'position:absolute;top:8px;right:12px;padding:2px 10px;cursor:pointer';
+  close.addEventListener('click', function () { box.parentNode.removeChild(box); });
+  box.appendChild(close);
+  w.document.body.appendChild(box);
+});
+</script>
 </body>
 </html>
