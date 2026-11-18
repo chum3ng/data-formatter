@@ -397,8 +397,9 @@
       }
       vm.validation = {
         status: 'valid', error: null, warnings: w,
-        label: res.parsed.fragment ? 'Valid fragment' : 'Valid',
-        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.'
+        label: res.parsed.loose ? (res.parsed.fragment ? 'Loose fragment' : 'Loose XML') : (res.parsed.fragment ? 'Valid fragment' : 'Valid'),
+        message: res.parsed.loose ? 'This is XML-like text: some tag names are not allowed in real XML, so it was read loosely. The nesting is correct and it was formatted as written.'
+          : res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.'
           : (fmt === 'sql' ? 'No unterminated strings, names or comments, and the parentheses balance. This is a text check only: the tool cannot check table names, types or the full grammar without your database.'
             : 'The input is valid ' + Convert.label(fmt) + '.')
       };

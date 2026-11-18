@@ -871,6 +871,10 @@
    Fragments: several top-level elements with no single root, for example <A>1</A><B>2</B>, are accepted as an
    "XML fragment" (parsed.fragment === true). They are formatted, minified and analyzed element by element, and
    convert to JSON as the keys of one object. Text outside elements is still an error.
+   Loose mode: parse(text, {loose:true}) keeps the strict reading of every tag that is valid XML, and for a tag that is
+   not (for example <Account #>, <Order No> or <a b=1>) it takes all the text inside the brackets as the tag name and
+   formats it as written (parsed.loose === true). Nesting must still match, so a wrong closing tag is still an error.
+   The browser parser is not used for loose text, and a strict XML parser will reject it.
    Prefix mode: parse(text, {from, prefix:true}) reads one element starting at an offset and reports {end}
    (used to find XML inside logs).
 
@@ -958,13 +962,49 @@
                  dt DOCTYPE     decl XML declaration
      ------------------------------------------------------------------ */
   function scan(text, opts) {
-    var fragment = !!(opts && opts.fragment), prefix = !!(opts && opts.prefix);
+    var fragment = !!(opts && opts.fragment), prefix = !!(opts && opts.prefix), loose = !!(opts && opts.loose);
+    var looseCount = 0, looseText = 0, looseNames = [], isLoose, loTag, gt;
     var n = text.length, i = (opts && opts.from) || 0, stack = [], doc = { kids: [] }, root = null, afterRoot = false;
     var hasDoctype = false, customEntities = false, maxDepth = 0, parserErrorName = false;
     var bad, parent, c, next, j, k, e, e2, q, ve, lt, name, an, attrs, seen, sc, el, top, end, cd, body, depth, quote, internal;
 
     function fail(msg, off, rel, code) {
       throw { __xmlError: true, message: msg, offset: off, related: rel === undefined ? -1 : rel, code: code || '' };
+    }
+    function firstToken(str) { var m = /^\S+/.exec(str); return m ? m[0] : str; }
+    // Loose mode only: does the "<" at p begin a tag, or is it a plain character in the text (a < 5)?
+    function tagStartAt(p) {
+      var ch = text.charCodeAt(p + 1), g, lt2;
+      if (isNameStart(ch) || ch === 47 || ch === 33 || ch === 63) { return true; }
+      if (ch !== ch || isWsc(ch) || ch === 60 || ch === 62 || ch === 61 || (ch >= 48 && ch <= 57)) { return false; }
+      g = text.indexOf('>', p + 1);
+      if (g < 0 || g - p > 300) { return false; }
+      lt2 = text.indexOf('<', p + 1);
+      return !(lt2 >= 0 && lt2 < g) && text.slice(p, g).indexOf('\n') < 0;
+    }
+    function nextTagStart(from) {
+      var idx = text.indexOf('<', from);
+      while (loose && idx !== -1 && !tagStartAt(idx)) { idx = text.indexOf('<', idx + 1); }
+      return idx === -1 ? n : idx;
+    }
+    // Loose mode only: everything up to the closing ">" is the tag (quotes count only right after "=").
+    function looseTag(p) {
+      var k = p + 1, quote = 0, last = 0, ch, inner, isSc;
+      while (k < n && k - p <= 400) {
+        ch = text.charCodeAt(k);
+        if (quote) { if (ch === quote) { quote = 0; } }
+        else if ((ch === 34 || ch === 39) && last === 61) { quote = ch; }
+        else if (ch === 62) { break; }
+        else if (ch === 60) { return null; }
+        if (!isWsc(ch)) { last = ch; }
+        k++;
+      }
+      if (k >= n || quote || text.charCodeAt(k) !== 62) { return null; }
+      inner = text.slice(p + 1, k);
+      isSc = inner.charAt(inner.length - 1) === '/';
+      if (isSc) { inner = inner.slice(0, -1); }
+      inner = inner.trim();
+      return inner ? { name: inner, sc: isSc, j: k + 1 } : null;
     }
     function nameEnd(p) {
       var ch = text.charCodeAt(p);
@@ -1011,15 +1051,18 @@
       if (prefix && afterRoot) { break; }
       parent = stack.length ? stack[stack.length - 1] : doc;
       c = text.charCodeAt(i);
-      if (c !== 60) {
-        j = text.indexOf('<', i);
-        if (j === -1) { j = n; }
+      if (c !== 60 || (loose && !tagStartAt(i))) {
+        j = nextTagStart(c === 60 ? i + 1 : i);
         if (parent === doc) {
           for (k = i; k < j; k++) { if (!isWsc(text.charCodeAt(k))) { fail('Text is not allowed outside the root element', k, undefined, 'outside'); } }
         } else {
-          checkRefs(i, j);
-          cd = text.slice(i, j).indexOf(']]>');
-          if (cd !== -1) { fail("']]>' is not allowed in text (write ]]&gt;)", i + cd); }
+          if (!loose) {
+            checkRefs(i, j);
+            cd = text.slice(i, j).indexOf(']]>');
+            if (cd !== -1) { fail("']]>' is not allowed in text (write ]]&gt;)", i + cd); }
+          } else {
+            try { checkRefs(i, j); } catch (refErr) { if (refErr && refErr.__xmlError) { looseText++; } else { throw refErr; } }
+          }
           parent.kids.push({ t: 'x', s: i, e: j });
         }
         i = j;
@@ -1078,54 +1121,70 @@
 
       if (next === 47) {                                   /* </ */
         k = nameEnd(i + 2);
-        if (k === i + 2) { fail('Malformed closing tag: a name is expected after </', i); }
-        name = text.slice(i + 2, k);
-        e2 = skipWs(k);
-        if (text.charCodeAt(e2) !== 62) { fail("Expected '>' to end the closing tag </" + name + '>', e2); }
+        e2 = k > i + 2 ? skipWs(k) : -1;
+        if (k > i + 2 && text.charCodeAt(e2) === 62) {
+          name = text.slice(i + 2, k);
+        } else if (loose && (gt = text.indexOf('>', i + 2)) !== -1 && gt - i < 400 && text.slice(i + 2, gt).indexOf('<') < 0 && text.slice(i + 2, gt).trim()) {
+          name = text.slice(i + 2, gt).trim();
+          e2 = gt;
+        } else if (k === i + 2) {
+          fail('Malformed closing tag: a name is expected after </', i);
+        } else {
+          fail("Expected '>' to end the closing tag </" + text.slice(i + 2, k) + '>', e2);
+        }
         top = stack.pop();
         if (!top) { fail('Closing tag </' + name + '> has no matching opening tag', i); }
-        if (top.n !== name) { fail('Mismatched closing tag: expected </' + top.n + '> but found </' + name + '>', i, top.s); }
-        top.cs = i; top.e = e2 + 1;
+        if (top.n !== name && !(loose && firstToken(top.n) === firstToken(name))) { fail('Mismatched closing tag: expected </' + top.n + '> but found </' + name + '>', i, top.s); }
+        top.cn = name; top.cs = i; top.e = e2 + 1;
         i = e2 + 1;
         if (!stack.length) { afterRoot = true; }
         continue;
       }
 
       /* start tag */
-      j = i + 1;
-      k = nameEnd(j);
-      if (k === j) { fail("'<' must be followed by a tag name. Write &lt; for a literal '<'", i); }
-      name = text.slice(j, k);
-      attrs = []; seen = Object.create(null); sc = false; j = k;
-      while (true) {
-        k = skipWs(j);
-        if (k >= n) { fail('Unterminated start tag <' + name + '>', i); }
-        c = text.charCodeAt(k);
-        if (c === 62) { j = k + 1; break; }
-        if (c === 47) {
-          if (text.charCodeAt(k + 1) === 62) { sc = true; j = k + 2; break; }
-          fail("Expected '>' after '/' in the tag", k);
+      isLoose = false;
+      try {
+        j = i + 1;
+        k = nameEnd(j);
+        if (k === j) { fail("'<' must be followed by a tag name. Write &lt; for a literal '<'", i); }
+        name = text.slice(j, k);
+        attrs = []; seen = Object.create(null); sc = false; j = k;
+        while (true) {
+          k = skipWs(j);
+          if (k >= n) { fail('Unterminated start tag <' + name + '>', i); }
+          c = text.charCodeAt(k);
+          if (c === 62) { j = k + 1; break; }
+          if (c === 47) {
+            if (text.charCodeAt(k + 1) === 62) { sc = true; j = k + 2; break; }
+            fail("Expected '>' after '/' in the tag", k);
+          }
+          if (k === j) { fail('Attributes must be separated by whitespace', k); }
+          e = nameEnd(k);
+          if (e === k) { fail("Invalid attribute name '" + text.charAt(k) + "'", k); }
+          an = text.slice(k, e);
+          e2 = skipWs(e);
+          if (text.charCodeAt(e2) !== 61) { fail("Attribute '" + an + "' needs a value: expected '=' after the name", e2 < n ? e2 : k); }
+          e2 = skipWs(e2 + 1);
+          q = text.charCodeAt(e2);
+          if (q !== 34 && q !== 39) { fail('Attribute values must be quoted with " or \'', e2 < n ? e2 : k); }
+          ve = text.indexOf(text.charAt(e2), e2 + 1);
+          if (ve === -1) { fail("Unterminated attribute value for '" + an + "'", e2); }
+          lt = text.indexOf('<', e2 + 1);
+          if (lt !== -1 && lt < ve) { fail("'<' is not allowed inside an attribute value (write &lt;)", lt); }
+          checkRefs(e2 + 1, ve);
+          if (seen[an]) { fail("Duplicate attribute '" + an + "'", k); }
+          seen[an] = true;
+          attrs.push({ n: an, v: text.slice(e2 + 1, ve), q: text.charAt(e2), s: k });
+          j = ve + 1;
         }
-        if (k === j) { fail('Attributes must be separated by whitespace', k); }
-        e = nameEnd(k);
-        if (e === k) { fail("Invalid attribute name '" + text.charAt(k) + "'", k); }
-        an = text.slice(k, e);
-        e2 = skipWs(e);
-        if (text.charCodeAt(e2) !== 61) { fail("Attribute '" + an + "' needs a value: expected '=' after the name", e2 < n ? e2 : k); }
-        e2 = skipWs(e2 + 1);
-        q = text.charCodeAt(e2);
-        if (q !== 34 && q !== 39) { fail('Attribute values must be quoted with " or \'', e2 < n ? e2 : k); }
-        ve = text.indexOf(text.charAt(e2), e2 + 1);
-        if (ve === -1) { fail("Unterminated attribute value for '" + an + "'", e2); }
-        lt = text.indexOf('<', e2 + 1);
-        if (lt !== -1 && lt < ve) { fail("'<' is not allowed inside an attribute value (write &lt;)", lt); }
-        checkRefs(e2 + 1, ve);
-        if (seen[an]) { fail("Duplicate attribute '" + an + "'", k); }
-        seen[an] = true;
-        attrs.push({ n: an, v: text.slice(e2 + 1, ve), q: text.charAt(e2), s: k });
-        j = ve + 1;
+      } catch (err) {
+        loTag = loose && err && err.__xmlError ? looseTag(i) : null;
+        if (!loTag) { throw err; }
+        name = loTag.name; attrs = []; sc = loTag.sc; j = loTag.j; isLoose = true;
+        looseCount++;
+        if (looseNames.length < 5 && looseNames.indexOf(name) < 0) { looseNames.push(name); }
       }
-      el = { t: 'e', n: name, s: i, e: 0, attrs: attrs, sc: sc, kids: [], os: j, cs: -1 };
+      el = { t: 'e', n: name, s: i, e: 0, attrs: attrs, sc: sc, kids: [], os: j, cs: -1, cn: name, loose: isLoose };
       if (parent === doc) {
         if ((afterRoot || root) && !fragment) { fail('Only one root element is allowed; a second element starts here', i, undefined, 'multiroot'); }
         if (!root) { root = el; }
@@ -1153,7 +1212,7 @@
         root = { t: 'e', n: '', implicit: true, s: tops[0].s, e: tops[tops.length - 1].e, attrs: [], sc: false, kids: tops, os: tops[0].s, cs: tops[tops.length - 1].e };
       }
     }
-    return { root: root, doc: doc, hasDoctype: hasDoctype, customEntities: customEntities, maxDepth: maxDepth, parserErrorName: parserErrorName, fragment: !!root.implicit };
+    return { root: root, doc: doc, hasDoctype: hasDoctype, customEntities: customEntities, maxDepth: maxDepth, parserErrorName: parserErrorName, fragment: !!root.implicit, loose: looseCount + looseText > 0, looseCount: looseCount, looseText: looseText, looseNames: looseNames };
   }
 
   /* ------------------------------------------------------------------
@@ -1207,11 +1266,11 @@
       }
       throw e;
     }
-    dom = (prefix || res.fragment) ? null : domCheck(text, res);
+    dom = (prefix || res.fragment || res.loose) ? null : domCheck(text, res);
     if (dom) { return { ok: false, error: dom }; }
     return {
       ok: true, text: text, root: res.root, doc: res.doc, hasDoctype: res.hasDoctype, customEntities: res.customEntities,
-      depth: res.maxDepth, fragment: res.fragment, end: res.root.e
+      depth: res.maxDepth, fragment: res.fragment, end: res.root.e, loose: res.loose, looseCount: res.looseCount, looseText: res.looseText, looseNames: res.looseNames
     };
   };
 
@@ -1258,7 +1317,7 @@
         if (nf.preserve) { flags.preserve = true; out.push(text.slice(el.s, el.e)); return; }
         if (nf.mixed) { flags.mixed = true; out.push(text.slice(el.s, el.e)); return; }
         if (el.sc) { out.push(startTag(el)); return; }
-        if (!nf.hasElem) { out.push(startTag(el), text.slice(el.os, el.cs), '</', el.n, '>'); return; }
+        if (!nf.hasElem) { out.push(startTag(el), text.slice(el.os, el.cs), '</', el.cn !== undefined ? el.cn : el.n, '>'); return; }
         out.push(startTag(el));
         stack.push({ el: el, i: 0, depth: depth });
       }
@@ -1267,7 +1326,7 @@
         f = stack[stack.length - 1];
         if (f.i >= f.el.kids.length) {
           stack.pop();
-          out.push(nl, ind(f.depth), '</', f.el.n, '>');
+          out.push(nl, ind(f.depth), '</', f.el.cn !== undefined ? f.el.cn : f.el.n, '>');
           continue;
         }
         k = f.el.kids[f.i++];
@@ -1333,11 +1392,23 @@
     return false;
   }
 
+  function looseNote(parsed) {
+    var parts = [], one = parsed.looseCount === 1, ot = parsed.looseText === 1;
+    if (parsed.looseCount) {
+      parts.push(parsed.looseCount + ' tag' + (one ? ' has a name' : 's have names') + ' that XML does not allow (for example "' + parsed.looseNames[0] + '")');
+    }
+    if (parsed.looseText) {
+      parts.push(parsed.looseText + ' piece' + (ot ? '' : 's') + ' of text ' + (ot ? 'has' : 'have') + ' a bare & or an entity such as &nbsp; that XML does not allow');
+    }
+    return parts.join(', and ') + '. Everything was formatted exactly as written, but a strict XML parser will reject this text.';
+  }
+
   Xml.analyze = function (parsed) {
     var a = Util.newAnalysis(), c = a.counts, text = parsed.text, li = null, stack = [];
     var f, kid, k, p;
     c.fields = c.objects = c.attributes = c.textNodes = c.whitespaceTexts = c.emptyElements = c.nulls = 0;
     a.notes = [];
+    if (parsed.loose) { a.notes.push(looseNote(parsed)); }
     if (parsed.hasDoctype) { a.notes.push('A DOCTYPE was found. External entities and DTDs are never loaded.'); }
 
     function pos(off) { li = li || Util.lineIndex(text); return li.at(off); }
@@ -1477,6 +1548,7 @@
     }
 
     try {
+      if (parsed.loose) { note('loose', 'warning', looseNote(parsed) + ' They became JSON keys as written.'); }
       if (parsed.customEntities) { throw { msg: 'The DOCTYPE defines custom entities, which are not expanded here, so the XML cannot be converted reliably.' }; }
       rootVal = convert(parsed.root, rootNs);
       while (stack.length) {
@@ -2569,6 +2641,9 @@
       r = Xml.parse(text);
       if (!r.ok && r.error.code === 'multiroot') {                     // several top-level elements: accept as a fragment
         r = Xml.parse(text, { fragment: true });          // a fragment error is the more useful one to report
+      }
+      if (!r.ok) {                                                      // odd tag names such as <Account #>: read them loosely
+        r = Xml.parse(text, { fragment: true, loose: true });   // loose mode only excuses tag names and text, so its error is the structural one
       }
     }
     else if (format === 'yaml') { r = Yaml.parse(text); }
@@ -3839,8 +3914,9 @@
       }
       vm.validation = {
         status: 'valid', error: null, warnings: w,
-        label: res.parsed.fragment ? 'Valid fragment' : 'Valid',
-        message: res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.'
+        label: res.parsed.loose ? (res.parsed.fragment ? 'Loose fragment' : 'Loose XML') : (res.parsed.fragment ? 'Valid fragment' : 'Valid'),
+        message: res.parsed.loose ? 'This is XML-like text: some tag names are not allowed in real XML, so it was read loosely. The nesting is correct and it was formatted as written.'
+          : res.parsed.fragment ? 'The input is a valid XML fragment: several top-level elements and no single root.'
           : (fmt === 'sql' ? 'No unterminated strings, names or comments, and the parentheses balance. This is a text check only: the tool cannot check table names, types or the full grammar without your database.'
             : 'The input is valid ' + Convert.label(fmt) + '.')
       };

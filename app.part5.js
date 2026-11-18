@@ -141,6 +141,9 @@
       if (!r.ok && r.error.code === 'multiroot') {                     // several top-level elements: accept as a fragment
         r = Xml.parse(text, { fragment: true });          // a fragment error is the more useful one to report
       }
+      if (!r.ok) {                                                      // odd tag names such as <Account #>: read them loosely
+        r = Xml.parse(text, { fragment: true, loose: true });   // loose mode only excuses tag names and text, so its error is the structural one
+      }
     }
     else if (format === 'yaml') { r = Yaml.parse(text); }
     else if (format === 'java') { r = JavaObj.parse(text); }
